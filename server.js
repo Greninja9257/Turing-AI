@@ -6,8 +6,79 @@ const path = require('path');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Simple logger utility
+const logger = {
+  info: (msg, data = {}) => {
+    console.log(JSON.stringify({ level: 'INFO', time: new Date().toISOString(), msg, ...data }));
+  },
+  error: (msg, error, data = {}) => {
+    console.error(JSON.stringify({
+      level: 'ERROR',
+      time: new Date().toISOString(),
+      msg,
+      error: error?.message || error,
+      stack: error?.stack,
+      ...data
+    }));
+  },
+  warn: (msg, data = {}) => {
+    console.warn(JSON.stringify({ level: 'WARN', time: new Date().toISOString(), msg, ...data }));
+  }
+};
+
+// Rate limiting
+const rateLimits = new Map(); // IP -> { count, resetTime }
+const RATE_LIMIT_WINDOW = 60000; // 1 minute
+const RATE_LIMIT_MAX = 60; // 60 requests per minute per IP
+
+function checkRateLimit(ip) {
+  const now = Date.now();
+  const limit = rateLimits.get(ip);
+
+  if (!limit || now > limit.resetTime) {
+    rateLimits.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    return true;
+  }
+
+  if (limit.count >= RATE_LIMIT_MAX) {
+    return false;
+  }
+
+  limit.count++;
+  return true;
+}
+
+// Write queue to prevent race conditions
+let saveQueue = Promise.resolve();
+let pendingSave = false;
+
+function queueSave() {
+  if (pendingSave) return;
+  pendingSave = true;
+
+  saveQueue = saveQueue.then(async () => {
+    pendingSave = false;
+    await saveMemory();
+  }).catch(err => {
+    pendingSave = false;
+    logger.error('Queued save failed', err);
+  });
+}
+
 // Middleware
 app.use(bodyParser.json({ limit: '50mb' }));
+
+// Rate limiting middleware
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+
+  if (!checkRateLimit(ip)) {
+    logger.warn('Rate limit exceeded', { ip, path: req.path });
+    return res.status(429).json({ error: 'Too many requests' });
+  }
+
+  next();
+});
 
 // CORS middleware - allow requests from anywhere (needed for trainer.html)
 app.use((req, res, next) => {
@@ -59,18 +130,21 @@ async function loadMemory() {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
     const data = await fs.readFile(MEMORY_FILE, 'utf8');
     globalMemory = JSON.parse(data);
-    console.log('✓ Memory loaded from disk');
+    logger.info('Memory loaded from disk', {
+      contextPairs: globalMemory.contextPairs?.length || 0,
+      semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length
+    });
   } catch (error) {
-    console.log('→ Starting with fresh memory');
+    logger.info('Starting with fresh memory');
   }
 }
 
 async function saveMemory() {
   try {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
-    await fs.writeFile(MEMORY_FILE, JSON.stringify(globalMemory, null, 2));
+    await fs.writeFile(MEMORY_FILE, JSON.stringify(globalMemory));
   } catch (error) {
-    console.error('Failed to save memory:', error);
+    logger.error('Failed to save memory', error);
   }
 }
 
@@ -267,8 +341,13 @@ class IntelligentLearner {
 
 // API Endpoints
 app.post('/api/chat', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { message, sessionId = 'default' } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
     
     // Clean the user message
     const cleanedMessage = TextCleaner.clean(message);
@@ -336,21 +415,24 @@ app.post('/api/chat', async (req, res) => {
           IntelligentLearner.learnPattern(prevPair.user, currentUser, quality);
           globalMemory.stats.liveConversationsLearned++;
 
-          // Save every 5 live learnings
-          if (globalMemory.stats.liveConversationsLearned % 5 === 0) {
-            await saveMemory();
+          // Queue save every 10 live learnings
+          if (globalMemory.stats.liveConversationsLearned % 10 === 0) {
+            queueSave();
           }
         }
       }
     }
-    
+
     globalMemory.stats.totalMessages++;
-    
-    // Periodic save every 20 messages
-    if (globalMemory.stats.totalMessages % 20 === 0) {
-      await saveMemory();
+
+    // Queue periodic save every 50 messages
+    if (globalMemory.stats.totalMessages % 50 === 0) {
+      queueSave();
     }
     
+    const duration = Date.now() - startTime;
+    logger.info('Chat request processed', { sessionId, duration, learned: isLearned });
+
     res.json({
       response,
       learned: isLearned,
@@ -358,19 +440,22 @@ app.post('/api/chat', async (req, res) => {
       activeUsers: activeSessions.size
     });
   } catch (error) {
-    console.error('Chat error:', error);
+    logger.error('Chat error', error, { sessionId: req.body?.sessionId });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
 app.post('/api/train', async (req, res) => {
+  const startTime = Date.now();
   try {
     const { conversations, batchSize = 100 } = req.body;
-    
+
     if (!conversations || !Array.isArray(conversations)) {
       return res.status(400).json({ error: 'Invalid conversations format' });
     }
-    
+
+    logger.info('Training started', { count: conversations.length, batchSize });
+
     let learned = 0;
     let filtered = 0;
     
@@ -413,14 +498,17 @@ app.post('/api/train', async (req, res) => {
         }
       }
       
-      // Periodic save
+      // Queue periodic save
       if (i % 500 === 0 && i > 0) {
-        await saveMemory();
+        queueSave();
       }
     }
-    
-    await saveMemory();
-    
+
+    queueSave();
+
+    const duration = Date.now() - startTime;
+    logger.info('Training completed', { learned, filtered, duration });
+
     res.json({
       success: true,
       learned,
@@ -429,7 +517,7 @@ app.post('/api/train', async (req, res) => {
       stats: globalMemory.stats
     });
   } catch (error) {
-    console.error('Training error:', error);
+    logger.error('Training error', error, { conversationCount: req.body?.conversations?.length });
     res.status(500).json({ error: 'Training failed' });
   }
 });
@@ -437,19 +525,27 @@ app.post('/api/train', async (req, res) => {
 app.get('/api/stats', (req, res) => {
   // Clean up old sessions (>5 minutes inactive)
   const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
+  let cleanedSessions = 0;
+
   for (const [sessionId, lastActivity] of activeSessions.entries()) {
     if (lastActivity < fiveMinutesAgo) {
       activeSessions.delete(sessionId);
+      conversationBuffer.delete(sessionId);
+      cleanedSessions++;
     }
   }
-  
+
+  if (cleanedSessions > 0) {
+    logger.info('Cleaned up inactive sessions', { count: cleanedSessions });
+  }
+
   res.json({
     stats: globalMemory.stats,
     activeUsers: activeSessions.size,
     memorySize: {
       contextPairs: globalMemory.contextPairs.length,
       semanticClusters: Object.keys(globalMemory.semanticClusters).length,
-      totalLearned: globalMemory.contextPairs.length + 
+      totalLearned: globalMemory.contextPairs.length +
         Object.values(globalMemory.semanticClusters).reduce((sum, cluster) => sum + cluster.length, 0)
     }
   });
@@ -458,8 +554,9 @@ app.get('/api/stats', (req, res) => {
 // Initialize and start server
 loadMemory().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 TuringAI running on port ${PORT}`);
-    console.log(`📊 Stats: ${globalMemory.stats.trainingDataPoints} trained, ${globalMemory.stats.liveConversationsLearned} live learned, ${globalMemory.stats.garbageFiltered} filtered`);
-    console.log(`🌍 Global learning: Everyone who chats contributes to shared knowledge!`);
+    logger.info('TuringAI server started', {
+      port: PORT,
+      stats: globalMemory.stats
+    });
   });
 });
