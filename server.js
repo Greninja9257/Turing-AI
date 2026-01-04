@@ -401,20 +401,20 @@ app.post('/api/chat', async (req, res) => {
       history.shift();
     }
     
-    // Auto-learn from quality conversations after 2+ exchanges
+    // Cleverbot-style learning: previous user message -> current user message
+    // This learns conversational flow patterns from actual human responses
     if (history.length >= 2) {
-      // Learn from the previous exchange
       const prevPair = history[history.length - 2];
+      const currentUserMsg = cleanedMessage;
 
-      // Only learn if both messages pass quality checks
-      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(prevPair.ai)) {
-        const quality = GarbageClassifier.calculateQuality(prevPair.user, prevPair.ai);
+      // Learn from user -> user patterns (ignore what the AI said in between)
+      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(currentUserMsg)) {
+        const quality = GarbageClassifier.calculateQuality(prevPair.user, currentUserMsg);
 
         if (quality >= 50) {
-          // Learn both directions: user -> AI and AI -> user
-          IntelligentLearner.learnPattern(prevPair.user, prevPair.ai, quality);
-          IntelligentLearner.learnPattern(prevPair.ai, prevPair.user, quality);
-          globalMemory.stats.liveConversationsLearned += 2;
+          // Learn: what humans say in response to previous human messages
+          IntelligentLearner.learnPattern(prevPair.user, currentUserMsg, quality);
+          globalMemory.stats.liveConversationsLearned++;
 
           // Queue save every 10 live learnings
           if (globalMemory.stats.liveConversationsLearned % 10 === 0) {
