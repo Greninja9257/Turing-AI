@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TuringAI - Intelligent Learning AI</title>
+    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --bg-dark: #0d0d0d;
+            --bg-card: #1a1a1a;
+            --accent-primary: #00ff88;
+            --accent-secondary: #00ccff;
+            --text-primary: #ffffff;
+            --text-secondary: #888888;
+            --border: #2a2a2a;
+            --error: #ff4444;
+            --success: #00ff88;
+        }
+        
+        body {
+            font-family: 'Syne', sans-serif;
+            background: var(--bg-dark);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            min-height: 100vh;
+        }
+        
+        /* Animated background */
+        .bg-grid {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: 
+                linear-gradient(var(--border) 1px, transparent 1px),
+                linear-gradient(90deg, var(--border) 1px, transparent 1px);
+            background-size: 50px 50px;
+            opacity: 0.3;
+            z-index: 0;
+            animation: gridMove 20s linear infinite;
+        }
+        
+        @keyframes gridMove {
+            0% { transform: translate(0, 0); }
+            100% { transform: translate(50px, 50px); }
+        }
+        
+        .gradient-orb {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(100px);
+            opacity: 0.15;
+            z-index: 0;
+            pointer-events: none;
+        }
+        
+        .orb-1 {
+            width: 600px;
+            height: 600px;
+            background: var(--accent-primary);
+            top: -200px;
+            right: -200px;
+            animation: float 15s ease-in-out infinite;
+        }
+        
+        .orb-2 {
+            width: 400px;
+            height: 400px;
+            background: var(--accent-secondary);
+            bottom: -150px;
+            left: -150px;
+            animation: float 20s ease-in-out infinite reverse;
+        }
+        
+        @keyframes float {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            50% { transform: translate(30px, -30px) scale(1.1); }
+        }
+        
+        /* Navigation */
+        nav {
+            position: relative;
+            z-index: 100;
+            padding: 30px 50px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+            background: rgba(13, 13, 13, 0.8);
+            backdrop-filter: blur(10px);
+        }
+        
+        .logo {
+            font-size: 28px;
+            font-weight: 800;
+            letter-spacing: -1px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .nav-tabs {
+            display: flex;
+            gap: 30px;
+        }
+        
+        .nav-tab {
+            padding: 10px 20px;
+            background: transparent;
+            border: 1px solid transparent;
+            color: var(--text-secondary);
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+            font-size: 14px;
+            border-radius: 8px;
+        }
+        
+        .nav-tab:hover {
+            color: var(--text-primary);
+            border-color: var(--border);
+        }
+        
+        .nav-tab.active {
+            color: var(--accent-primary);
+            border-color: var(--accent-primary);
+            background: rgba(0, 255, 136, 0.05);
+        }
+        
+        /* Main container */
+        .container {
+            position: relative;
+            z-index: 10;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 40px 50px;
+        }
+        
+        .page {
+            display: none;
+            animation: fadeIn 0.5s;
+        }
+        
+        .page.active {
+            display: block;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Chat page */
+        .chat-layout {
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 30px;
+            height: calc(100vh - 200px);
+        }
+        
+        .chat-main {
+            display: flex;
+            flex-direction: column;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            overflow: hidden;
+        }
+        
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .chat-messages::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .chat-messages::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        
+        .chat-messages::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+        
+        .message {
+            display: flex;
+            gap: 15px;
+            animation: messageSlide 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            margin-bottom: 20px;
+        }
+        
+        @keyframes messageSlide {
+            from {
+                opacity: 0;
+                transform: translateY(15px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .message.user {
+            flex-direction: row-reverse;
+        }
+        
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 16px;
+            flex-shrink: 0;
+        }
+        
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+        }
+        
+        .message.ai .message-avatar {
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            color: var(--bg-dark);
+        }
+        
+        .message-content {
+            display: flex;
+            flex-direction: column;
+            max-width: 75%;
+            min-width: 100px;
+        }
+        
+        .message-bubble {
+            padding: 12px 16px;
+            border-radius: 18px;
+            font-size: 15px;
+            line-height: 1.5;
+            word-wrap: break-word;
+            white-space: pre-wrap;
+            display: inline-block;
+            width: fit-content;
+        }
+        
+        .message.user .message-bubble {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            border-bottom-right-radius: 4px;
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.2);
+            margin-left: auto;
+        }
+        
+        .message.ai .message-bubble {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            border-bottom-left-radius: 4px;
+        }
+        
+        .message-badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 600;
+            margin-top: 8px;
+            background: rgba(0, 255, 136, 0.15);
+            color: var(--accent-primary);
+            font-family: 'JetBrains Mono', monospace;
+        }
+        
+        .typing-indicator {
+            display: none;
+            gap: 15px;
+            animation: messageSlide 0.4s;
+        }
+        
+        .typing-indicator.active {
+            display: flex;
+        }
+        
+        .typing-dots {
+            display: flex;
+            gap: 6px;
+            padding: 15px 20px;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            border-bottom-left-radius: 4px;
+        }
+        
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: var(--accent-primary);
+            animation: typingBounce 1.4s infinite;
+        }
+        
+        .typing-dot:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        
+        .typing-dot:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        
+        @keyframes typingBounce {
+            0%, 60%, 100% { transform: translateY(0); }
+            30% { transform: translateY(-10px); }
+        }
+        
+        .chat-input-area {
+            padding: 25px 30px;
+            border-top: 1px solid var(--border);
+            background: rgba(26, 26, 26, 0.8);
+            backdrop-filter: blur(10px);
+        }
+        
+        .input-wrapper {
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+        }
+        
+        .chat-input {
+            flex: 1;
+            background: var(--bg-dark);
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            padding: 15px 20px;
+            color: var(--text-primary);
+            font-size: 15px;
+            font-family: 'Syne', sans-serif;
+            resize: none;
+            max-height: 150px;
+            transition: border-color 0.3s;
+        }
+        
+        .chat-input:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+        
+        .send-btn {
+            padding: 15px 30px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            border: none;
+            border-radius: 12px;
+            color: var(--bg-dark);
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 15px;
+            font-family: 'Syne', sans-serif;
+        }
+        
+        .send-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 255, 136, 0.3);
+        }
+        
+        .send-btn:active {
+            transform: translateY(0);
+        }
+        
+        /* Sidebar */
+        .chat-sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .stat-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 25px;
+        }
+        
+        .stat-card h3 {
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-bottom: 15px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 600;
+        }
+        
+        .stat-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .stat-item:last-child {
+            border-bottom: none;
+        }
+        
+        .stat-label {
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+        
+        .stat-value {
+            font-size: 18px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--accent-primary);
+        }
+        
+        .info-card {
+            background: rgba(0, 255, 136, 0.05);
+            border: 1px solid rgba(0, 255, 136, 0.2);
+            border-radius: 16px;
+            padding: 20px;
+        }
+        
+        .info-card h4 {
+            font-size: 15px;
+            margin-bottom: 10px;
+            color: var(--accent-primary);
+        }
+        
+        .info-card p {
+            font-size: 13px;
+            color: var(--text-secondary);
+            line-height: 1.6;
+        }
+        
+        /* Training page */
+        .training-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 30px;
+        }
+        
+        .training-main {
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+        
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 30px;
+        }
+        
+        .card h2 {
+            font-size: 24px;
+            margin-bottom: 20px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .input-group {
+            margin-bottom: 20px;
+        }
+        
+        .input-group label {
+            display: block;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .input-group input,
+        .input-group textarea {
+            width: 100%;
+            background: var(--bg-dark);
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            padding: 15px 20px;
+            color: var(--text-primary);
+            font-size: 14px;
+            font-family: 'JetBrains Mono', monospace;
+            transition: border-color 0.3s;
+        }
+        
+        .input-group input:focus,
+        .input-group textarea:focus {
+            outline: none;
+            border-color: var(--accent-primary);
+        }
+        
+        .input-group textarea {
+            resize: vertical;
+            min-height: 200px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+        
+        .btn {
+            padding: 15px 30px;
+            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
+            border: none;
+            border-radius: 12px;
+            color: var(--bg-dark);
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 15px;
+            font-family: 'Syne', sans-serif;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 30px rgba(0, 255, 136, 0.3);
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-secondary {
+            background: transparent;
+            border: 2px solid var(--border);
+            color: var(--text-primary);
+        }
+        
+        .btn-secondary:hover {
+            border-color: var(--accent-primary);
+            box-shadow: none;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 12px;
+            background: var(--bg-dark);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-top: 20px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-primary), var(--accent-secondary));
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        .log-container {
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            line-height: 1.8;
+        }
+        
+        .log-entry {
+            padding: 8px;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            animation: fadeIn 0.3s;
+        }
+        
+        .log-success { color: var(--success); background: rgba(0, 255, 136, 0.05); }
+        .log-error { color: var(--error); background: rgba(255, 68, 68, 0.05); }
+        .log-info { color: var(--accent-secondary); background: rgba(0, 204, 255, 0.05); }
+        
+        .dataset-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+        
+        .dataset-item {
+            background: var(--bg-dark);
+            border: 2px solid var(--border);
+            border-radius: 12px;
+            padding: 15px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        
+        .dataset-item:hover {
+            border-color: var(--accent-primary);
+        }
+        
+        .dataset-item input[type="checkbox"] {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        
+        .dataset-info {
+            flex: 1;
+        }
+        
+        .dataset-name {
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 4px;
+        }
+        
+        .dataset-desc {
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+        
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .chat-layout,
+            .training-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .chat-sidebar {
+                order: -1;
+            }
+        }
+        
+        @media (max-width: 768px) {
+            nav {
+                padding: 20px 25px;
+            }
+            
+            .container {
+                padding: 25px;
+            }
+            
+            .nav-tabs {
+                gap: 15px;
+            }
+            
+            .chat-layout {
+                height: calc(100vh - 160px);
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="bg-grid"></div>
+    <div class="gradient-orb orb-1"></div>
+    <div class="gradient-orb orb-2"></div>
+    
+    <nav>
+        <div class="logo">TuringAI</div>
+    </nav>
+    
+    <div class="container">
+        <!-- File Protocol Warning -->
+        <div id="fileWarning" style="display: none; background: rgba(255, 170, 0, 0.1); border: 2px solid var(--warning); border-radius: 16px; padding: 20px; margin-bottom: 20px; text-align: center;">
+            <div style="font-size: 18px; font-weight: 700; color: var(--warning); margin-bottom: 10px;">⚠️ Not Running From Server</div>
+            <div style="font-size: 14px; color: var(--text-secondary);">
+                You opened this file directly. For full functionality, start the server with <code style="background: rgba(0,0,0,0.3); padding: 2px 8px; border-radius: 4px;">npm start</code> and visit <strong>http://localhost:3000</strong>
+            </div>
+        </div>
+        
+        <!-- Chat Page -->
+        <div id="chatPage" class="page active">
+            <div class="chat-layout">
+                <div class="chat-main">
+                    <div class="chat-messages" id="chatMessages">
+                        <!-- Messages will appear here -->
+                    </div>
+                    
+                    <div class="typing-indicator" id="typingIndicator">
+                        <div class="message-avatar" style="background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary)); color: var(--bg-dark);">AI</div>
+                        <div class="typing-dots">
+                            <div class="typing-dot"></div>
+                            <div class="typing-dot"></div>
+                            <div class="typing-dot"></div>
+                        </div>
+                    </div>
+                    
+                    <div class="chat-input-area">
+                        <div class="input-wrapper">
+                            <textarea class="chat-input" id="chatInput" placeholder="Type your message..." rows="1"></textarea>
+                            <button class="send-btn" id="sendBtn">Send</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="chat-sidebar">
+                    <div class="stat-card">
+                        <h3>Model Info</h3>
+                        <div class="stat-item">
+                            <span class="stat-label">Knowledge Base</span>
+                            <span class="stat-value" id="statKnowledgeSize">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Active Users</span>
+                            <span class="stat-value" id="statActiveUsers">1</span>
+                        </div>
+                    </div>
+                    
+                    <div class="info-card">
+                        <h4>🧠 Learning AI</h4>
+                        <p>Every conversation helps me learn. I remember patterns and get smarter over time!</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+        </div>
+    </div>
+    
+    <script>
+        // Detect if running from file:// or from server
+        let API_BASE;
+        if (window.location.protocol === 'file:') {
+            // Opened as file, default to localhost
+            API_BASE = 'http://localhost:3000';
+            console.warn('Running from file://. Using default server: ' + API_BASE);
+            // Show warning banner
+            document.getElementById('fileWarning').style.display = 'block';
+        } else {
+            // Running from server, use current origin
+            API_BASE = window.location.origin;
+        }
+        
+        // Generate unique session ID for this browser session
+        const SESSION_ID = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        
+        // Chat functionality
+        const chatMessages = document.getElementById('chatMessages');
+        const chatInput = document.getElementById('chatInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const typingIndicator = document.getElementById('typingIndicator');
+        
+        async function sendMessage() {
+            const message = chatInput.value.trim();
+            if (!message) return;
+            
+            addMessage(message, true);
+            chatInput.value = '';
+            chatInput.style.height = 'auto';
+            
+            typingIndicator.classList.add('active');
+            scrollToBottom();
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/chat`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message, sessionId: SESSION_ID })
+                });
+                
+                const data = await response.json();
+                
+                setTimeout(() => {
+                    typingIndicator.classList.remove('active');
+                    addMessage(data.response, false, data.learned);
+                    if (data.stats) {
+                        updateStats(data.stats, data.activeUsers);
+                    }
+                }, 800);
+            } catch (error) {
+                typingIndicator.classList.remove('active');
+                addMessage('Sorry, I encountered an error. Please try again.', false);
+            }
+        }
+        
+        function addMessage(text, isUser, isLearned = false) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${isUser ? 'user' : 'ai'}`;
+            
+            messageDiv.innerHTML = `
+                <div class="message-avatar">${isUser ? 'You' : 'AI'}</div>
+                <div class="message-content">
+                    <div class="message-bubble">${escapeHtml(text)}</div>
+                </div>
+            `;
+            
+            chatMessages.appendChild(messageDiv);
+            scrollToBottom();
+        }
+        
+        function scrollToBottom() {
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        sendBtn.addEventListener('click', sendMessage);
+        chatInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+        
+        // Auto-resize textarea
+        chatInput.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = Math.min(this.scrollHeight, 150) + 'px';
+        });
+        
+        function updateStats(stats, activeUsers) {
+            if (!stats) return;
+            
+            // Calculate total knowledge base size (semantic clusters + context pairs)
+            const knowledgeSize = (stats.trainingDataPoints || 0) + (stats.liveConversationsLearned || 0);
+            
+            // Format number with k/m suffix
+            let displaySize;
+            if (knowledgeSize >= 1000000) {
+                displaySize = (knowledgeSize / 1000000).toFixed(1) + 'M';
+            } else if (knowledgeSize >= 1000) {
+                displaySize = (knowledgeSize / 1000).toFixed(1) + 'k';
+            } else {
+                displaySize = knowledgeSize.toString();
+            }
+            
+            document.getElementById('statKnowledgeSize').textContent = displaySize;
+            
+            // Update active users
+            if (activeUsers !== undefined) {
+                document.getElementById('statActiveUsers').textContent = activeUsers;
+            }
+        }
+        
+        // Periodically refresh active user count
+        setInterval(() => {
+            fetch(`${API_BASE}/api/stats`)
+                .then(r => r.json())
+                .then(data => {
+                    updateStats(data.stats, data.activeUsers);
+                })
+                .catch(() => {});
+        }, 30000); // Update every 30 seconds
+        
+        // Load initial stats
+        fetch(`${API_BASE}/api/stats`)
+            .then(r => r.json())
+            .then(data => updateStats(data.stats, data.activeUsers))
+            .catch(() => {});
+    </script>
+</body>
+</html>
