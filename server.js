@@ -4,7 +4,7 @@ const fs = require('fs').promises;
 const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 
 // Simple logger utility
 const logger = {
@@ -401,19 +401,20 @@ app.post('/api/chat', async (req, res) => {
       history.shift();
     }
     
-    // Auto-learn from quality conversations after 3+ exchanges
-    if (history.length >= 3) {
-      // Learn from pairs: previous user message -> current user message
-      const prevPair = history[history.length - 2]; // Previous exchange
-      const currentUser = cleanedMessage; // Current user message
+    // Auto-learn from quality conversations after 2+ exchanges
+    if (history.length >= 2) {
+      // Learn from the previous exchange
+      const prevPair = history[history.length - 2];
 
       // Only learn if both messages pass quality checks
-      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(currentUser)) {
-        const quality = GarbageClassifier.calculateQuality(prevPair.user, currentUser);
+      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(prevPair.ai)) {
+        const quality = GarbageClassifier.calculateQuality(prevPair.user, prevPair.ai);
 
-        if (quality >= 50) { // Higher threshold for live learning
-          IntelligentLearner.learnPattern(prevPair.user, currentUser, quality);
-          globalMemory.stats.liveConversationsLearned++;
+        if (quality >= 50) {
+          // Learn both directions: user -> AI and AI -> user
+          IntelligentLearner.learnPattern(prevPair.user, prevPair.ai, quality);
+          IntelligentLearner.learnPattern(prevPair.ai, prevPair.user, quality);
+          globalMemory.stats.liveConversationsLearned += 2;
 
           // Queue save every 10 live learnings
           if (globalMemory.stats.liveConversationsLearned % 10 === 0) {
