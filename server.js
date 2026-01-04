@@ -143,26 +143,25 @@ class GarbageClassifier {
   }
   
   static calculateQuality(input, response) {
-    let score = 50; // Base score
-    
-    // Length appropriateness (more lenient)
+    let score = 70; // Higher base score - short answers are fine!
+
     const inputWords = input.split(/\s+/).length;
     const responseWords = response.split(/\s+/).length;
-    
-    if (responseWords >= 2 && responseWords <= 100) score += 20;
+
+    // Reward any reasonable input length
     if (inputWords >= 1 && inputWords <= 50) score += 15;
-    
-    // Has some substance (not just one-word replies like "k" or "ok")
-    if (responseWords >= 3) score += 15;
-    
-    // Natural conversational quality
-    if (!/^(ok|k|yeah|yep|nope)$/i.test(response)) score += 10;
-    
-    // Note: We don't penalize OR reward informal speech
+
+    // Reward any reasonable response length (including short ones!)
+    if (responseWords >= 1 && responseWords <= 100) score += 15;
+
+    // Note: We don't penalize short answers
+    // "yes", "no", "maybe" are all valid responses
+    // "ok", "thanks", "cool" are all valid responses
+    // We don't penalize OR reward informal speech
     // Both "you" and "u" are equally valid
     // Both "thanks" and "thx" are equally valid
     // The AI can learn natural human conversation without bias
-    
+
     return Math.max(0, Math.min(100, score));
   }
 }
@@ -325,23 +324,21 @@ app.post('/api/chat', async (req, res) => {
     
     // Auto-learn from quality conversations after 3+ exchanges
     if (history.length >= 3) {
-      // Learn from the conversation pair 2 messages ago (gives context)
-      const learningIndex = history.length - 2;
-      if (learningIndex >= 0) {
-        const pair = history[learningIndex];
-        
-        // Only learn if both messages pass quality checks
-        if (!GarbageClassifier.isGarbage(pair.user) && !GarbageClassifier.isGarbage(pair.ai)) {
-          const quality = GarbageClassifier.calculateQuality(pair.user, pair.ai);
-          
-          if (quality >= 50) { // Higher threshold for live learning
-            IntelligentLearner.learnPattern(pair.user, pair.ai, quality);
-            globalMemory.stats.liveConversationsLearned++;
-            
-            // Save every 5 live learnings
-            if (globalMemory.stats.liveConversationsLearned % 5 === 0) {
-              await saveMemory();
-            }
+      // Learn from pairs: previous user message -> current user message
+      const prevPair = history[history.length - 2]; // Previous exchange
+      const currentUser = cleanedMessage; // Current user message
+
+      // Only learn if both messages pass quality checks
+      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(currentUser)) {
+        const quality = GarbageClassifier.calculateQuality(prevPair.user, currentUser);
+
+        if (quality >= 50) { // Higher threshold for live learning
+          IntelligentLearner.learnPattern(prevPair.user, currentUser, quality);
+          globalMemory.stats.liveConversationsLearned++;
+
+          // Save every 5 live learnings
+          if (globalMemory.stats.liveConversationsLearned % 5 === 0) {
+            await saveMemory();
           }
         }
       }
