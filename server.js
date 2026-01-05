@@ -240,11 +240,8 @@ class GarbageClassifier {
     const upperWords = words.filter(w => w === w.toUpperCase() && w.length > 1);
     if (upperWords.length / words.length > 0.6) return true;
 
-    // Filter out single-word responses that are too generic
-    if (words.length === 1) {
-      const genericWords = ['ok', 'k', 'lol', 'yeah', 'yep', 'nope', 'idk', 'bruh', 'oof'];
-      if (genericWords.includes(lower)) return true;
-    }
+    // Don't filter single-word responses - humans use them naturally
+    // Allow: ok, yeah, lol, cool, nice, etc.
 
     // Filter gibberish - too few vowels
     const vowelRatio = (lower.match(/[aeiou]/g) || []).length / lower.length;
@@ -254,27 +251,23 @@ class GarbageClassifier {
   }
   
   static calculateQuality(input, response) {
-    let score = 40; // Lower base score - be more selective
+    let score = 50; // Base score - accept natural conversation
 
     const inputWords = input.split(/\s+/).length;
     const responseWords = response.split(/\s+/).length;
 
-    // Reward reasonable input length (2+ words is better)
-    if (inputWords >= 2 && inputWords <= 50) score += 20;
-    else if (inputWords === 1) score += 5; // Small bonus for single words
+    // Accept all reasonable lengths - humans talk in varied ways
+    if (inputWords >= 1 && inputWords <= 50) score += 15;
+    if (responseWords >= 1 && responseWords <= 100) score += 15;
 
-    // Reward meaningful responses (2+ words preferred)
-    if (responseWords >= 2 && responseWords <= 100) score += 25;
-    else if (responseWords === 1) score += 10;
-
-    // Bonus for conversational responses
+    // Bonus for multi-word responses (but don't penalize short ones)
     if (responseWords >= 3 && responseWords <= 20) score += 10;
 
-    // Penalize very short exchanges
-    if (inputWords === 1 && responseWords === 1) score -= 20;
-
-    // Bonus for punctuation (shows effort)
+    // Bonus for punctuation
     if (response.match(/[.!?]$/)) score += 5;
+
+    // Small bonus for variety (not just repeating same word)
+    if (input.toLowerCase() !== response.toLowerCase()) score += 5;
 
     return Math.max(0, Math.min(100, score));
   }
@@ -473,87 +466,76 @@ app.post('/api/chat', async (req, res) => {
     let response = IntelligentLearner.findBestResponse(cleanedMessage);
     let isLearned = !!response;
     
-    // Smart fallback responses based on message content
+    // Cleverbot-style fallback responses - natural and casual
     if (!response) {
       const lower = cleanedMessage.toLowerCase();
 
-      // Detect question patterns
-      if (lower.match(/^(what|where|when|who|why|how|which|whose)/)) {
-        const questionFallbacks = [
-          "that's a good question! what do you think?",
-          "hmm, i'm not sure yet. what would you say?",
-          "interesting question! how would you answer that?",
-          "i haven't learned about that yet. what's your take?",
-          "good question! tell me what you know about it",
-        ];
-        response = questionFallbacks[Math.floor(Math.random() * questionFallbacks.length)];
-      }
-      // Detect greetings
-      else if (lower.match(/^(hi|hey|hello|sup|yo|greetings|howdy)\b/)) {
+      // Detect greetings - respond naturally
+      if (lower.match(/^(hi|hey|hello|sup|yo|greetings|howdy|wassup|what's up)\b/)) {
         const greetingFallbacks = [
-          "hey! how's it going?",
-          "hi there! what's up?",
-          "hello! how are you today?",
-          "hey! what's on your mind?",
-          "hi! how's your day been?",
+          "hey",
+          "hi",
+          "hello",
+          "hey there",
+          "hi!",
+          "sup",
+          "yo",
+          "hey! how are you?",
+          "hello! how's it going?",
         ];
         response = greetingFallbacks[Math.floor(Math.random() * greetingFallbacks.length)];
       }
-      // Detect statements about likes/preferences
-      else if (lower.match(/\b(like|love|enjoy|favorite|prefer|hate|dislike)\b/)) {
-        const preferenceFallbacks = [
-          "oh nice! what else do you like?",
-          "that's cool! why do you feel that way?",
-          "interesting! tell me more about that",
-          "i see! what makes you say that?",
-          "cool! what got you into that?",
+      // Detect "how are you" type questions
+      else if (lower.match(/how (are|r) (you|u)|how's it going|hows it going|what's up|whats up/)) {
+        const statusFallbacks = [
+          "good, you?",
+          "pretty good!",
+          "not bad, how about you?",
+          "doing alright",
+          "i'm good thanks",
+          "fine, and you?",
+          "great! how are you?",
         ];
-        response = preferenceFallbacks[Math.floor(Math.random() * preferenceFallbacks.length)];
+        response = statusFallbacks[Math.floor(Math.random() * statusFallbacks.length)];
       }
-      // Detect "I am" or "I'm" statements
-      else if (lower.match(/\b(i am|i'm|im)\b/)) {
-        const aboutYouFallbacks = [
-          "oh really? tell me more",
-          "that's interesting! what else about you?",
-          "cool! how long have you been like that?",
-          "nice! what's that like for you?",
-          "i see! what made you that way?",
+      // Detect questions - turn them back
+      else if (lower.match(/^(what|where|when|who|why|how|which|whose|\?)/)) {
+        const questionFallbacks = [
+          "what do you think?",
+          "i'm not sure, what would you say?",
+          "hmm, good question",
+          "that's interesting, tell me your thoughts",
+          "not sure tbh",
+          "idk, what about you?",
+          "what's your take on it?",
         ];
-        response = aboutYouFallbacks[Math.floor(Math.random() * aboutYouFallbacks.length)];
+        response = questionFallbacks[Math.floor(Math.random() * questionFallbacks.length)];
       }
-      // Detect "you are" or "you're" statements (talking about the AI)
-      else if (lower.match(/\b(you are|you're|youre|u are|ur)\b/)) {
-        const aboutMeFallbacks = [
-          "haha thanks! what else?",
-          "interesting perspective! why do you think that?",
-          "i appreciate that! what makes you say so?",
-          "that's cool you think that! tell me more",
-          "thanks for letting me know! what else is on your mind?",
-        ];
-        response = aboutMeFallbacks[Math.floor(Math.random() * aboutMeFallbacks.length)];
-      }
-      // Short messages (1-3 words)
-      else if (cleanedMessage.split(/\s+/).length <= 3) {
-        const shortFallbacks = [
-          "tell me more about that!",
-          "interesting! what else?",
-          "go on, i'm listening",
-          "yeah? what about it?",
-          "i hear you! keep going",
-        ];
-        response = shortFallbacks[Math.floor(Math.random() * shortFallbacks.length)];
-      }
-      // Default fallbacks for longer messages
+      // General conversational fallbacks - short and natural like humans
       else {
-        const defaultFallbacks = [
-          "that's interesting! tell me more",
-          "i see! what else can you tell me?",
-          "hmm, i'm still learning about that. what do you think?",
-          "interesting perspective! keep going",
-          "i haven't thought about it that way. tell me more",
-          "that's new to me! what else should i know?",
+        const casualFallbacks = [
+          "oh really?",
+          "interesting",
+          "cool",
+          "nice",
+          "that's cool",
+          "oh nice",
+          "yeah?",
+          "for real?",
+          "i see",
+          "tell me more",
+          "go on",
+          "interesting!",
+          "oh wow",
+          "haha nice",
+          "that's interesting",
+          "cool, tell me more",
+          "nice! what else?",
+          "oh that's cool",
+          "i feel that",
+          "makes sense",
         ];
-        response = defaultFallbacks[Math.floor(Math.random() * defaultFallbacks.length)];
+        response = casualFallbacks[Math.floor(Math.random() * casualFallbacks.length)];
       }
     }
     
@@ -582,7 +564,8 @@ app.post('/api/chat', async (req, res) => {
       if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(currentUserMsg)) {
         const quality = GarbageClassifier.calculateQuality(prevPair.user, currentUserMsg);
 
-        if (quality >= 50) {
+        // Lower threshold to accept natural human conversation (including short responses)
+        if (quality >= 40) {
           // Learn: what humans say in response to previous human messages
           IntelligentLearner.learnPattern(prevPair.user, currentUserMsg, quality);
           globalMemory.stats.liveConversationsLearned++;
