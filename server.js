@@ -190,6 +190,14 @@ async function saveMemory() {
     try {
       const stats = await fs.stat(MEMORY_FILE);
       logger.info('Memory saved to disk', { bytes: stats.size });
+
+      // Create a simple rotating backup (overwrite .bak) to help recovery on abrupt resets
+      try {
+        await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak');
+        logger.info('Backup saved', { backup: MEMORY_FILE + '.bak' });
+      } catch (bakErr) {
+        // non-fatal
+      }
     } catch (statErr) {
       logger.info('Memory saved to disk');
     }
@@ -198,7 +206,31 @@ async function saveMemory() {
     try { await fs.unlink(tempFile); } catch (e) {}
     logger.error('Failed to save memory', error);
   }
-} 
+}
+
+// Optionally force synchronous saves after live learning (useful on platforms that may be killed abruptly)
+const FORCE_SYNC_ON_LEARN = process.env.FORCE_SYNC_ON_LEARN === '1';
+
+function saveMemorySync() {
+  try {
+    const dataStr = JSON.stringify(globalMemory);
+    const tempFile = MEMORY_FILE + '.sync.tmp';
+    fsSync.writeFileSync(tempFile, dataStr, 'utf8');
+    fsSync.renameSync(tempFile, MEMORY_FILE);
+
+    try {
+      const stats = fsSync.statSync(MEMORY_FILE);
+      logger.info('Sync memory saved to disk', { bytes: stats.size });
+    } catch (e) {
+      logger.info('Sync memory saved to disk');
+    }
+
+    // Create/overwrite a simple .bak backup to aid recovery
+    try { fsSync.copyFileSync(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) { /* ignore backup errors */ }
+  } catch (error) {
+    logger.error('Failed to sync save memory', error);
+  }
+}
 
 // Text cleaning utility
 class TextCleaner {
@@ -636,9 +668,23 @@ app.post('/api/chat', async (req, res) => {
           // Learn: what humans say in response to previous human messages
           IntelligentLearner.learnPattern(prevPair.user, currentUserMsg, quality);
           globalMemory.stats.liveConversationsLearned++;
+          logger.info('Live conversation learned', {
+            input: prevPair.user,
+            response: currentUserMsg,
+            quality,
+            totalLiveLearned: globalMemory.stats.liveConversationsLearned
+          });
 
-          // Queue save every 5 live learnings (more frequent to prevent data loss)
-          if (globalMemory.stats.liveConversationsLearned % 5 === 0) {
+          // Immediately queue a save (batched by queueSave) to persist live learnings quickly.
+          // queueSave is idempotent / debounced so this won't cause excessive writes.
+          if (FORCE_SYNC_ON_LEARN) {
+            try {
+              saveMemorySync();
+              logger.info('Sync save performed on live learn');
+            } catch (err) {
+              logger.error('Sync save failed on live learn', err);
+            }
+          } else {
             queueSave();
           }
         }
@@ -647,8 +693,8 @@ app.post('/api/chat', async (req, res) => {
 
     globalMemory.stats.totalMessages++;
 
-    // Queue periodic save every 50 messages
-    if (globalMemory.stats.totalMessages % 50 === 0) {
+    // Queue periodic save every 10 messages (more frequent to reduce data loss)
+    if (globalMemory.stats.totalMessages % 10 === 0) {
       queueSave();
     }
     
@@ -797,8 +843,10 @@ loadMemory().then(() => {
     });
   });
 
-  // Auto-save every 5 minutes as a safety net
+  const SAVE_INTERVAL_MS = parseInt(process.env.SAVE_INTERVAL_MS, 10) || 60 * 1000;
+  logger.info('Memory persistence configured', { FORCE_SYNC_ON_LEARN, SAVE_INTERVAL_MS });
+  // Auto-save as a safety net (configurable via SAVE_INTERVAL_MS env var)
   setInterval(() => {
     queueSave();
-  }, 5 * 60 * 1000);
+  }, SAVE_INTERVAL_MS);
 });
