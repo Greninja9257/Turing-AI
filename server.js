@@ -199,6 +199,44 @@ class TextCleaner {
 }
 
 // Garbage classification system
+// Profanity helpers (normalization + simple deobfuscation)
+const DEFAULT_BANNED_WORDS = new Set([
+  'fuck','fucker','fucking','shit','bitch','bastard','asshole','dick','douche','cunt','whore','slut',
+  'nigger','nigga','faggot','fag','retard','spaz','kys'
+]);
+
+function normalizeForProfanity(text) {
+  if (!text) return { original: '', lettersOnly: '', collapsed: '' };
+  let normalized = text.normalize('NFKC').toLowerCase();
+  normalized = normalized.replace(/\p{M}/gu, ''); // remove diacritics
+
+  const leetMap = { '4': 'a', '@': 'a', '3': 'e', '1': 'i', '!': 'i', '0': 'o', '\$': 's', '5': 's', '7': 't', '8': 'b' };
+  for (const [k, v] of Object.entries(leetMap)) {
+    normalized = normalized.replace(new RegExp(k, 'g'), v);
+  }
+
+  const lettersOnly = normalized.replace(/[^a-z]/g, '');
+  const collapsed = lettersOnly.replace(/(.)\1{2,}/g, '$1$1');
+  return { original: normalized, lettersOnly, collapsed };
+}
+
+function containsProfanity(text) {
+  if (!text) return { found: false, matches: [] };
+  const lower = text.toLowerCase();
+  const matches = new Set();
+
+  for (const word of DEFAULT_BANNED_WORDS) {
+    const re = new RegExp('\\b' + word.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\b', 'i');
+    if (re.test(lower)) matches.add(word);
+  }
+
+  const { lettersOnly, collapsed } = normalizeForProfanity(text);
+  for (const word of DEFAULT_BANNED_WORDS) {
+    if (collapsed.includes(word) || lettersOnly.includes(word)) matches.add(word);
+  }
+
+  return { found: matches.size > 0, matches: Array.from(matches) };
+}
 class GarbageClassifier {
   static isGarbage(text) {
     const lower = text.toLowerCase().trim();
@@ -228,12 +266,14 @@ class GarbageClassifier {
 
     // Offensive/harmful content
     const harmfulPatterns = [
-      /\b(kill yourself|kys)\b/i,
-      /\b(n[i1]gg[ae]r|f[a4]gg[o0]t)\b/i,
-      /\b(retard|autis[tm])\b/i,
+      /\b(kill yourself|kys)\b/i
     ];
 
     if (harmfulPatterns.some(pattern => pattern.test(text))) return true;
+
+    // Centralized profanity detection (handles obfuscation and leet)
+    const profanity = containsProfanity(text);
+    if (profanity.found) return true;
 
     // Stricter shouting detection
     const words = text.split(/\s+/);
@@ -674,6 +714,21 @@ app.post('/api/train', async (req, res) => {
   } catch (error) {
     logger.error('Training error', error, { conversationCount: req.body?.conversations?.length });
     res.status(500).json({ error: 'Training failed' });
+  }
+});
+
+app.post('/api/check-text', (req, res) => {
+  try {
+    const { text } = req.body || {};
+    if (typeof text !== 'string') return res.status(400).json({ error: 'text is required in the request body' });
+
+    const profanity = containsProfanity(text);
+    const flagged = GarbageClassifier.isGarbage(text);
+
+    res.json({ text, flagged, profanityMatches: profanity.matches });
+  } catch (err) {
+    logger.error('check-text error', err);
+    res.status(500).json({ error: 'internal error' });
   }
 });
 
