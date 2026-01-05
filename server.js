@@ -713,81 +713,11 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-app.post('/api/train', async (req, res) => {
-  const startTime = Date.now();
-  try {
-    const { conversations, batchSize = 100 } = req.body;
-
-    if (!conversations || !Array.isArray(conversations)) {
-      return res.status(400).json({ error: 'Invalid conversations format' });
-    }
-
-    logger.info('Training started', { count: conversations.length, batchSize });
-
-    let learned = 0;
-    let filtered = 0;
-    
-    // Process in batches
-    for (let i = 0; i < conversations.length; i += batchSize) {
-      const batch = conversations.slice(i, i + batchSize);
-      
-      for (const conv of batch) {
-        let { input, response } = conv;
-        
-        // Clean text to remove conversation prefixes
-        input = TextCleaner.clean(input);
-        response = TextCleaner.clean(response);
-        
-        // Skip if cleaning removed everything
-        if (!input || !response) {
-          filtered++;
-          globalMemory.stats.garbageFiltered++;
-          continue;
-        }
-        
-        // Filter garbage
-        if (GarbageClassifier.isGarbage(input) || GarbageClassifier.isGarbage(response)) {
-          filtered++;
-          globalMemory.stats.garbageFiltered++;
-          continue;
-        }
-        
-        // Calculate quality
-        const quality = GarbageClassifier.calculateQuality(input, response);
-        
-        // Only learn if quality is acceptable
-        if (quality >= 40) {
-          IntelligentLearner.learnPattern(input, response, quality);
-          learned++;
-          globalMemory.stats.trainingDataPoints++;
-        } else {
-          filtered++;
-          globalMemory.stats.garbageFiltered++;
-        }
-      }
-      
-      // Queue periodic save
-      if (i % 500 === 0 && i > 0) {
-        queueSave();
-      }
-    }
-
-    queueSave();
-
-    const duration = Date.now() - startTime;
-    logger.info('Training completed', { learned, filtered, duration });
-
-    res.json({
-      success: true,
-      learned,
-      filtered,
-      totalProcessed: conversations.length,
-      stats: globalMemory.stats
-    });
-  } catch (error) {
-    logger.error('Training error', error, { conversationCount: req.body?.conversations?.length });
-    res.status(500).json({ error: 'Training failed' });
-  }
+// Training endpoint removed — use offline tooling or admin scripts for bulk training.
+// Keep a minimal 410 response so clients know the endpoint is intentionally gone.
+app.post('/api/train', (req, res) => {
+  logger.warn('Deprecated endpoint /api/train called');
+  res.status(410).json({ error: 'Training endpoint has been removed.' });
 });
 
 app.post('/api/check-text', (req, res) => {
