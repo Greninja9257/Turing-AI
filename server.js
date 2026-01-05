@@ -1,6 +1,7 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const path = require('path');
 
 const app = express();
@@ -76,11 +77,21 @@ async function gracefulShutdown(signal) {
   try {
     // Wait for any pending saves
     await saveQueue;
-    // Force final save
+    // Force final save (async)
     await saveMemory();
     logger.info('Final memory save completed');
   } catch (err) {
     logger.error('Error during shutdown save', err);
+  }
+
+  // As a last-resort, attempt a synchronous save to avoid loss on abrupt exits (best-effort)
+  try {
+    const syncTemp = MEMORY_FILE + '.sync.tmp';
+    fsSync.writeFileSync(syncTemp, JSON.stringify(globalMemory), 'utf8');
+    fsSync.renameSync(syncTemp, MEMORY_FILE);
+    logger.info('Synchronous final memory save completed');
+  } catch (syncErr) {
+    logger.error('Synchronous final save failed', syncErr);
   }
 
   process.exit(0);
@@ -160,18 +171,34 @@ async function loadMemory() {
       semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length
     });
   } catch (error) {
-    logger.info('Starting with fresh memory');
+    if (error && error.code === 'ENOENT') {
+      logger.info('Memory file not found; starting with fresh memory');
+    } else {
+      logger.error('Failed to load memory; starting with fresh memory', error);
+    }
   }
-}
+} 
 
 async function saveMemory() {
+  const dataStr = JSON.stringify(globalMemory);
+  const tempFile = MEMORY_FILE + '.tmp';
   try {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
-    await fs.writeFile(MEMORY_FILE, JSON.stringify(globalMemory));
+    await fs.writeFile(tempFile, dataStr, 'utf8');
+    await fs.rename(tempFile, MEMORY_FILE);
+
+    try {
+      const stats = await fs.stat(MEMORY_FILE);
+      logger.info('Memory saved to disk', { bytes: stats.size });
+    } catch (statErr) {
+      logger.info('Memory saved to disk');
+    }
   } catch (error) {
+    // Try to clean up temp file if present
+    try { await fs.unlink(tempFile); } catch (e) {}
     logger.error('Failed to save memory', error);
   }
-}
+} 
 
 // Text cleaning utility
 class TextCleaner {
