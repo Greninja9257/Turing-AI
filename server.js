@@ -473,26 +473,88 @@ app.post('/api/chat', async (req, res) => {
     let response = IntelligentLearner.findBestResponse(cleanedMessage);
     let isLearned = !!response;
     
-    // Fallback responses if nothing learned
+    // Smart fallback responses based on message content
     if (!response) {
-      const fallbacks = [
-        "oh really? tell me more about that",
-        "that's interesting, what else?",
-        "hmm i don't know much about that yet, but i'm learning!",
-        "cool! what made you think of that?",
-        "i see, keep going",
-        "interesting! what else comes to mind?",
-        "yeah? tell me more",
-        "that's new to me, what else should i know?",
-        "good question lol, what do you think?",
-        "ooh that's cool, continue",
-        "i'm still learning about this tbh",
-        "nice! what else?",
-        "fr? that's interesting",
-        "i hear you, go on",
-        "makes sense, what else?"
-      ];
-      response = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+      const lower = cleanedMessage.toLowerCase();
+
+      // Detect question patterns
+      if (lower.match(/^(what|where|when|who|why|how|which|whose)/)) {
+        const questionFallbacks = [
+          "that's a good question! what do you think?",
+          "hmm, i'm not sure yet. what would you say?",
+          "interesting question! how would you answer that?",
+          "i haven't learned about that yet. what's your take?",
+          "good question! tell me what you know about it",
+        ];
+        response = questionFallbacks[Math.floor(Math.random() * questionFallbacks.length)];
+      }
+      // Detect greetings
+      else if (lower.match(/^(hi|hey|hello|sup|yo|greetings|howdy)\b/)) {
+        const greetingFallbacks = [
+          "hey! how's it going?",
+          "hi there! what's up?",
+          "hello! how are you today?",
+          "hey! what's on your mind?",
+          "hi! how's your day been?",
+        ];
+        response = greetingFallbacks[Math.floor(Math.random() * greetingFallbacks.length)];
+      }
+      // Detect statements about likes/preferences
+      else if (lower.match(/\b(like|love|enjoy|favorite|prefer|hate|dislike)\b/)) {
+        const preferenceFallbacks = [
+          "oh nice! what else do you like?",
+          "that's cool! why do you feel that way?",
+          "interesting! tell me more about that",
+          "i see! what makes you say that?",
+          "cool! what got you into that?",
+        ];
+        response = preferenceFallbacks[Math.floor(Math.random() * preferenceFallbacks.length)];
+      }
+      // Detect "I am" or "I'm" statements
+      else if (lower.match(/\b(i am|i'm|im)\b/)) {
+        const aboutYouFallbacks = [
+          "oh really? tell me more",
+          "that's interesting! what else about you?",
+          "cool! how long have you been like that?",
+          "nice! what's that like for you?",
+          "i see! what made you that way?",
+        ];
+        response = aboutYouFallbacks[Math.floor(Math.random() * aboutYouFallbacks.length)];
+      }
+      // Detect "you are" or "you're" statements (talking about the AI)
+      else if (lower.match(/\b(you are|you're|youre|u are|ur)\b/)) {
+        const aboutMeFallbacks = [
+          "haha thanks! what else?",
+          "interesting perspective! why do you think that?",
+          "i appreciate that! what makes you say so?",
+          "that's cool you think that! tell me more",
+          "thanks for letting me know! what else is on your mind?",
+        ];
+        response = aboutMeFallbacks[Math.floor(Math.random() * aboutMeFallbacks.length)];
+      }
+      // Short messages (1-3 words)
+      else if (cleanedMessage.split(/\s+/).length <= 3) {
+        const shortFallbacks = [
+          "tell me more about that!",
+          "interesting! what else?",
+          "go on, i'm listening",
+          "yeah? what about it?",
+          "i hear you! keep going",
+        ];
+        response = shortFallbacks[Math.floor(Math.random() * shortFallbacks.length)];
+      }
+      // Default fallbacks for longer messages
+      else {
+        const defaultFallbacks = [
+          "that's interesting! tell me more",
+          "i see! what else can you tell me?",
+          "hmm, i'm still learning about that. what do you think?",
+          "interesting perspective! keep going",
+          "i haven't thought about it that way. tell me more",
+          "that's new to me! what else should i know?",
+        ];
+        response = defaultFallbacks[Math.floor(Math.random() * defaultFallbacks.length)];
+      }
     }
     
     // Store conversation in buffer for potential learning
