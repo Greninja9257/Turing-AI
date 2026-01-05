@@ -50,20 +50,45 @@ function checkRateLimit(ip) {
 
 // Write queue to prevent race conditions
 let saveQueue = Promise.resolve();
-let pendingSave = false;
+let saveScheduled = false;
 
 function queueSave() {
-  if (pendingSave) return;
-  pendingSave = true;
+  if (saveScheduled) return; // Already scheduled
+  saveScheduled = true;
 
-  saveQueue = saveQueue.then(async () => {
-    pendingSave = false;
-    await saveMemory();
-  }).catch(err => {
-    pendingSave = false;
-    logger.error('Queued save failed', err);
+  // Schedule save on next tick to batch multiple rapid calls
+  setImmediate(() => {
+    saveQueue = saveQueue.then(async () => {
+      saveScheduled = false;
+      await saveMemory();
+      logger.info('Memory saved to disk');
+    }).catch(err => {
+      saveScheduled = false;
+      logger.error('Queued save failed', err);
+    });
   });
 }
+
+// Graceful shutdown - save memory before exit
+async function gracefulShutdown(signal) {
+  logger.info('Shutdown signal received', { signal });
+
+  try {
+    // Wait for any pending saves
+    await saveQueue;
+    // Force final save
+    await saveMemory();
+    logger.info('Final memory save completed');
+  } catch (err) {
+    logger.error('Error during shutdown save', err);
+  }
+
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2')); // nodemon restart
 
 // Middleware
 app.use(bodyParser.json({ limit: '50mb' }));
@@ -177,15 +202,15 @@ class TextCleaner {
 class GarbageClassifier {
   static isGarbage(text) {
     const lower = text.toLowerCase().trim();
-    
-    // Too short or too long (more lenient now)
-    if (lower.length < 1 || lower.length > 1000) return true;
-    
-    // Excessive special characters (more lenient)
+
+    // Stricter length requirements
+    if (lower.length < 1 || lower.length > 500) return true;
+
+    // Stricter special character filtering
     const specialCharRatio = (text.match(/[^a-zA-Z0-9\s.,!?'-]/g) || []).length / text.length;
-    if (specialCharRatio > 0.5) return true; // Was 0.3, now 0.5
-    
-    // Spam patterns (keep strict for actual spam)
+    if (specialCharRatio > 0.3) return true;
+
+    // Spam patterns
     const spamPatterns = [
       /click here/i,
       /buy now/i,
@@ -193,48 +218,63 @@ class GarbageClassifier {
       /act now/i,
       /free money/i,
       /\b(viagra|cialis|casino)\b/i,
-      /http[s]?:\/\/[^\s]{30,}/i, // Very long URLs only (was 20, now 30)
-      /(.)\1{8,}/, // Repeated characters (was 5, now 8 - allow some emphasis)
-      /\d{6,}/, // Very long number sequences (was 4, now 6)
+      /http[s]?:\/\/[^\s]{20,}/i, // Long URLs
+      /(.)\1{5,}/, // Repeated characters (stricter)
+      /\d{5,}/, // Long number sequences (stricter)
+      /\b(subscribe|follow me|check out my)\b/i,
     ];
-    
+
     if (spamPatterns.some(pattern => pattern.test(text))) return true;
-    
-    // Offensive/harmful content (keep strict)
+
+    // Offensive/harmful content
     const harmfulPatterns = [
       /\b(kill yourself|kys)\b/i,
       /\b(n[i1]gg[ae]r|f[a4]gg[o0]t)\b/i,
+      /\b(retard|autis[tm])\b/i,
     ];
-    
+
     if (harmfulPatterns.some(pattern => pattern.test(text))) return true;
-    
-    // Too many uppercase words - SHOUTING (more lenient)
+
+    // Stricter shouting detection
     const words = text.split(/\s+/);
     const upperWords = words.filter(w => w === w.toUpperCase() && w.length > 1);
-    if (upperWords.length / words.length > 0.8) return true; // Was 0.5, now 0.8
-    
+    if (upperWords.length / words.length > 0.6) return true;
+
+    // Filter out single-word responses that are too generic
+    if (words.length === 1) {
+      const genericWords = ['ok', 'k', 'lol', 'yeah', 'yep', 'nope', 'idk', 'bruh', 'oof'];
+      if (genericWords.includes(lower)) return true;
+    }
+
+    // Filter gibberish - too few vowels
+    const vowelRatio = (lower.match(/[aeiou]/g) || []).length / lower.length;
+    if (vowelRatio < 0.15 && lower.length > 3) return true;
+
     return false;
   }
   
   static calculateQuality(input, response) {
-    let score = 70; // Higher base score - short answers are fine!
+    let score = 40; // Lower base score - be more selective
 
     const inputWords = input.split(/\s+/).length;
     const responseWords = response.split(/\s+/).length;
 
-    // Reward any reasonable input length
-    if (inputWords >= 1 && inputWords <= 50) score += 15;
+    // Reward reasonable input length (2+ words is better)
+    if (inputWords >= 2 && inputWords <= 50) score += 20;
+    else if (inputWords === 1) score += 5; // Small bonus for single words
 
-    // Reward any reasonable response length (including short ones!)
-    if (responseWords >= 1 && responseWords <= 100) score += 15;
+    // Reward meaningful responses (2+ words preferred)
+    if (responseWords >= 2 && responseWords <= 100) score += 25;
+    else if (responseWords === 1) score += 10;
 
-    // Note: We don't penalize short answers
-    // "yes", "no", "maybe" are all valid responses
-    // "ok", "thanks", "cool" are all valid responses
-    // We don't penalize OR reward informal speech
-    // Both "you" and "u" are equally valid
-    // Both "thanks" and "thx" are equally valid
-    // The AI can learn natural human conversation without bias
+    // Bonus for conversational responses
+    if (responseWords >= 3 && responseWords <= 20) score += 10;
+
+    // Penalize very short exchanges
+    if (inputWords === 1 && responseWords === 1) score -= 20;
+
+    // Bonus for punctuation (shows effort)
+    if (response.match(/[.!?]$/)) score += 5;
 
     return Math.max(0, Math.min(100, score));
   }
@@ -256,40 +296,109 @@ class IntelligentLearner {
   
   static learnPattern(input, response, quality) {
     const keywords = this.extractKeywords(input);
-    
-    // Create semantic clusters
+    const inputLower = input.toLowerCase();
+
+    // Create semantic clusters with relearning support
     keywords.forEach(keyword => {
       if (!globalMemory.semanticClusters[keyword]) {
         globalMemory.semanticClusters[keyword] = [];
       }
-      
-      // Store with quality weighting
-      globalMemory.semanticClusters[keyword].push({
-        input: input.toLowerCase(),
-        response,
-        quality,
-        timestamp: Date.now()
-      });
-      
+
+      // Check if this exact input already exists
+      const existingIndex = globalMemory.semanticClusters[keyword].findIndex(
+        item => item.input === inputLower
+      );
+
+      if (existingIndex !== -1) {
+        const existing = globalMemory.semanticClusters[keyword][existingIndex];
+
+        // If same response, reinforce it (increase confidence)
+        if (existing.response === response) {
+          existing.confidence = (existing.confidence || 1) + 1;
+          existing.quality = Math.min(100, existing.quality + 2); // Small quality boost
+          existing.timestamp = Date.now();
+        } else {
+          // Different response - only replace if new quality is significantly better
+          // OR if pattern is old (allow relearning over time)
+          const ageInDays = (Date.now() - existing.timestamp) / (1000 * 60 * 60 * 24);
+
+          if (quality > existing.quality + 10 || ageInDays > 30) {
+            // Replace with new pattern
+            globalMemory.semanticClusters[keyword][existingIndex] = {
+              input: inputLower,
+              response,
+              quality,
+              confidence: 1,
+              timestamp: Date.now()
+            };
+          }
+          // Otherwise keep existing (it's more confident)
+        }
+      } else {
+        // New pattern
+        globalMemory.semanticClusters[keyword].push({
+          input: inputLower,
+          response,
+          quality,
+          confidence: 1,
+          timestamp: Date.now()
+        });
+      }
+
       // Keep only top 20 highest quality responses per keyword
-      globalMemory.semanticClusters[keyword].sort((a, b) => b.quality - a.quality);
+      globalMemory.semanticClusters[keyword].sort((a, b) => {
+        const scoreA = b.quality * (b.confidence || 1);
+        const scoreB = a.quality * (a.confidence || 1);
+        return scoreA - scoreB;
+      });
       if (globalMemory.semanticClusters[keyword].length > 20) {
         globalMemory.semanticClusters[keyword] = globalMemory.semanticClusters[keyword].slice(0, 20);
       }
     });
-    
-    // Store high-quality pairs separately
+
+    // Store high-quality pairs separately with relearning
     if (quality >= 60) {
-      globalMemory.contextPairs.push({
-        input: input.toLowerCase(),
-        response,
-        quality,
-        timestamp: Date.now()
-      });
-      
-      // Keep only top 1000 context pairs
+      const existingPairIndex = globalMemory.contextPairs.findIndex(
+        pair => pair.input === inputLower
+      );
+
+      if (existingPairIndex !== -1) {
+        const existing = globalMemory.contextPairs[existingPairIndex];
+
+        if (existing.response === response) {
+          // Reinforce
+          existing.confidence = (existing.confidence || 1) + 1;
+          existing.quality = Math.min(100, existing.quality + 2);
+          existing.timestamp = Date.now();
+        } else {
+          const ageInDays = (Date.now() - existing.timestamp) / (1000 * 60 * 60 * 24);
+          if (quality > existing.quality + 10 || ageInDays > 30) {
+            globalMemory.contextPairs[existingPairIndex] = {
+              input: inputLower,
+              response,
+              quality,
+              confidence: 1,
+              timestamp: Date.now()
+            };
+          }
+        }
+      } else {
+        globalMemory.contextPairs.push({
+          input: inputLower,
+          response,
+          quality,
+          confidence: 1,
+          timestamp: Date.now()
+        });
+      }
+
+      // Keep only top 1000 context pairs by quality * confidence
       if (globalMemory.contextPairs.length > 1000) {
-        globalMemory.contextPairs.sort((a, b) => b.quality - a.quality);
+        globalMemory.contextPairs.sort((a, b) => {
+          const scoreA = b.quality * (b.confidence || 1);
+          const scoreB = a.quality * (a.confidence || 1);
+          return scoreA - scoreB;
+        });
         globalMemory.contextPairs = globalMemory.contextPairs.slice(0, 1000);
       }
     }
@@ -416,8 +525,8 @@ app.post('/api/chat', async (req, res) => {
           IntelligentLearner.learnPattern(prevPair.user, currentUserMsg, quality);
           globalMemory.stats.liveConversationsLearned++;
 
-          // Queue save every 10 live learnings
-          if (globalMemory.stats.liveConversationsLearned % 10 === 0) {
+          // Queue save every 5 live learnings (more frequent to prevent data loss)
+          if (globalMemory.stats.liveConversationsLearned % 5 === 0) {
             queueSave();
           }
         }
@@ -560,4 +669,9 @@ loadMemory().then(() => {
       stats: globalMemory.stats
     });
   });
+
+  // Auto-save every 5 minutes as a safety net
+  setInterval(() => {
+    queueSave();
+  }, 5 * 60 * 1000);
 });
