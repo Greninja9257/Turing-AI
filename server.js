@@ -164,20 +164,72 @@ const MEMORY_FILE = path.join(__dirname, 'data', 'memory.json');
 async function loadMemory() {
   try {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
-    const data = await fs.readFile(MEMORY_FILE, 'utf8');
-    globalMemory = JSON.parse(data);
-    logger.info('Memory loaded from disk', {
-      contextPairs: globalMemory.contextPairs?.length || 0,
-      semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length
-    });
-  } catch (error) {
-    if (error && error.code === 'ENOENT') {
-      logger.info('Memory file not found; starting with fresh memory');
-    } else {
-      logger.error('Failed to load memory; starting with fresh memory', error);
+
+    // Try reading the primary memory file
+    let data;
+    try {
+      data = await fs.readFile(MEMORY_FILE, 'utf8');
+    } catch (err) {
+      if (err && err.code === 'ENOENT') {
+        logger.info('Memory file not found; starting with fresh memory');
+        return;
+      }
+      throw err;
     }
+
+    // If file is empty, attempt to recover from backup
+    if (!data || !data.trim()) {
+      logger.warn('Memory file is empty; attempting to restore from backup');
+      try {
+        const bakData = await fs.readFile(MEMORY_FILE + '.bak', 'utf8');
+        if (bakData && bakData.trim()) {
+          globalMemory = JSON.parse(bakData);
+          logger.info('Memory restored from backup', { backup: MEMORY_FILE + '.bak' });
+          // Ensure main memory file is consistent with restored data
+          await saveMemory();
+          return;
+        } else {
+          logger.warn('Backup file is empty; starting with fresh memory');
+          return;
+        }
+      } catch (bakErr) {
+        if (bakErr && bakErr.code === 'ENOENT') {
+          logger.info('Backup not found; starting with fresh memory');
+          return;
+        }
+        throw bakErr;
+      }
+    }
+
+    // Parse primary memory file
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed && typeof parsed === 'object') {
+        globalMemory = parsed;
+        logger.info('Memory loaded from disk', {
+          contextPairs: globalMemory.contextPairs?.length || 0,
+          semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length
+        });
+      } else {
+        throw new Error('Parsed memory is not an object');
+      }
+    } catch (parseErr) {
+      // Attempt to restore from backup if parsing fails
+      logger.warn('Failed to parse memory file; attempting to restore from backup', { error: parseErr.message });
+      try {
+        const bakData = await fs.readFile(MEMORY_FILE + '.bak', 'utf8');
+        const parsedBak = JSON.parse(bakData);
+        globalMemory = parsedBak;
+        logger.info('Memory restored from backup after parse error', { backup: MEMORY_FILE + '.bak' });
+        await saveMemory();
+      } catch (bakErr) {
+        logger.error('Failed to restore memory from backup; starting with fresh memory', bakErr);
+      }
+    }
+  } catch (error) {
+    logger.error('Failed to load memory; starting with fresh memory', error);
   }
-} 
+}
 
 async function saveMemory() {
   const dataStr = JSON.stringify(globalMemory);
