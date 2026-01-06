@@ -172,44 +172,25 @@ async function loadMemory() {
     // Make sure persistent dir exists (best-effort)
     try { await fs.mkdir(PERSISTENT_DIR, { recursive: true }); } catch (e) { /* ignore */ }
 
-    // Candidate files to consider (primary + persistent, and their .bak files)
+    // Prefer persistent storage on platforms where project files reset (e.g. Replit)
     const candidatePaths = [
-      MEMORY_FILE,
-      MEMORY_FILE + '.bak',
       PERSISTENT_MEMORY_FILE,
-      PERSISTENT_MEMORY_FILE + '.bak'
+      PERSISTENT_MEMORY_FILE + '.bak',
+      MEMORY_FILE,
+      MEMORY_FILE + '.bak'
     ];
-
-    // Gather existing candidates with mtime
-    const existing = [];
-    for (const p of candidatePaths) {
-      try {
-        const stat = await fs.stat(p);
-        existing.push({ path: p, mtime: stat.mtimeMs });
-      } catch (e) {
-        // file does not exist
-      }
-    }
-
-    if (existing.length === 0) {
-      logger.info('No memory or backups found; starting with fresh memory', { primary: MEMORY_FILE, persistent: PERSISTENT_MEMORY_FILE });
-      return;
-    }
-
-    // Prefer the most recently modified valid JSON file
-    existing.sort((a, b) => b.mtime - a.mtime);
 
     let loaded = false;
 
-    for (const candidate of existing) {
+    for (const candidatePath of candidatePaths) {
       try {
-        const data = await fs.readFile(candidate.path, 'utf8');
+        const data = await fs.readFile(candidatePath, 'utf8');
         if (!data || !data.trim()) continue;
 
         const parsed = JSON.parse(data);
         if (parsed && typeof parsed === 'object') {
           globalMemory = parsed;
-          logger.info('Memory loaded from disk', { source: candidate.path, contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
+          logger.info('Memory loaded from disk', { source: candidatePath, contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
 
           // Sync chosen memory into primary and persistent locations (best-effort)
           try {
@@ -236,7 +217,10 @@ async function loadMemory() {
           break;
         }
       } catch (err) {
-        logger.warn('Failed to parse or read candidate memory file; continuing', { file: candidate.path, error: err.message });
+        if (err && err.code === 'ENOENT') {
+          continue;
+        }
+        logger.warn('Failed to parse or read candidate memory file; continuing', { file: candidatePath, error: err.message });
         continue;
       }
     }
