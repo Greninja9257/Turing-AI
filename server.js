@@ -3,9 +3,14 @@ const bodyParser = require('body-parser');
 const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
+const os = require('os');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// Persistent memory path (useful for platforms like Replit where project files may be overwritten)
+const PERSISTENT_DIR = process.env.PERSISTENT_MEMORY_DIR || path.join(os.homedir(), '.turing-ai');
+const PERSISTENT_MEMORY_FILE = path.join(PERSISTENT_DIR, 'memory.json');
 
 // Simple logger utility
 const logger = {
@@ -164,72 +169,85 @@ const MEMORY_FILE = path.join(__dirname, 'data', 'memory.json');
 async function loadMemory() {
   try {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
+    // Make sure persistent dir exists (best-effort)
+    try { await fs.mkdir(PERSISTENT_DIR, { recursive: true }); } catch (e) { /* ignore */ }
 
-    // Try reading the primary memory file
-    let data;
-    try {
-      data = await fs.readFile(MEMORY_FILE, 'utf8');
-    } catch (err) {
-      if (err && err.code === 'ENOENT') {
-        logger.info('Memory file not found; starting with fresh memory');
-        return;
-      }
-      throw err;
-    }
+    // Candidate files to consider (primary + persistent, and their .bak files)
+    const candidatePaths = [
+      MEMORY_FILE,
+      MEMORY_FILE + '.bak',
+      PERSISTENT_MEMORY_FILE,
+      PERSISTENT_MEMORY_FILE + '.bak'
+    ];
 
-    // If file is empty, attempt to recover from backup
-    if (!data || !data.trim()) {
-      logger.warn('Memory file is empty; attempting to restore from backup');
+    // Gather existing candidates with mtime
+    const existing = [];
+    for (const p of candidatePaths) {
       try {
-        const bakData = await fs.readFile(MEMORY_FILE + '.bak', 'utf8');
-        if (bakData && bakData.trim()) {
-          globalMemory = JSON.parse(bakData);
-          logger.info('Memory restored from backup', { backup: MEMORY_FILE + '.bak' });
-          // Ensure main memory file is consistent with restored data
-          await saveMemory();
-          return;
-        } else {
-          logger.warn('Backup file is empty; starting with fresh memory');
-          return;
-        }
-      } catch (bakErr) {
-        if (bakErr && bakErr.code === 'ENOENT') {
-          logger.info('Backup not found; starting with fresh memory');
-          return;
-        }
-        throw bakErr;
+        const stat = await fs.stat(p);
+        existing.push({ path: p, mtime: stat.mtimeMs });
+      } catch (e) {
+        // file does not exist
       }
     }
 
-    // Parse primary memory file
-    try {
-      const parsed = JSON.parse(data);
-      if (parsed && typeof parsed === 'object') {
-        globalMemory = parsed;
-        logger.info('Memory loaded from disk', {
-          contextPairs: globalMemory.contextPairs?.length || 0,
-          semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length
-        });
-      } else {
-        throw new Error('Parsed memory is not an object');
-      }
-    } catch (parseErr) {
-      // Attempt to restore from backup if parsing fails
-      logger.warn('Failed to parse memory file; attempting to restore from backup', { error: parseErr.message });
+    if (existing.length === 0) {
+      logger.info('No memory or backups found; starting with fresh memory', { primary: MEMORY_FILE, persistent: PERSISTENT_MEMORY_FILE });
+      return;
+    }
+
+    // Prefer the most recently modified valid JSON file
+    existing.sort((a, b) => b.mtime - a.mtime);
+
+    let loaded = false;
+
+    for (const candidate of existing) {
       try {
-        const bakData = await fs.readFile(MEMORY_FILE + '.bak', 'utf8');
-        const parsedBak = JSON.parse(bakData);
-        globalMemory = parsedBak;
-        logger.info('Memory restored from backup after parse error', { backup: MEMORY_FILE + '.bak' });
-        await saveMemory();
-      } catch (bakErr) {
-        logger.error('Failed to restore memory from backup; starting with fresh memory', bakErr);
+        const data = await fs.readFile(candidate.path, 'utf8');
+        if (!data || !data.trim()) continue;
+
+        const parsed = JSON.parse(data);
+        if (parsed && typeof parsed === 'object') {
+          globalMemory = parsed;
+          logger.info('Memory loaded from disk', { source: candidate.path, contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
+
+          // Sync chosen memory into primary and persistent locations (best-effort)
+          try {
+            await fs.writeFile(MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
+            await fs.rename(MEMORY_FILE + '.tmp', MEMORY_FILE);
+          } catch (e) {
+            logger.warn('Failed to sync memory to primary location', { error: e.message });
+          }
+
+          try {
+            await fs.mkdir(PERSISTENT_DIR, { recursive: true });
+            await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
+            await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
+          } catch (e) {
+            // non-fatal
+            logger.warn('Failed to sync memory to persistent location', { error: e.message });
+          }
+
+          // Ensure backups exist (best-effort)
+          try { await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) {}
+          try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
+
+          loaded = true;
+          break;
+        }
+      } catch (err) {
+        logger.warn('Failed to parse or read candidate memory file; continuing', { file: candidate.path, error: err.message });
+        continue;
       }
+    }
+
+    if (!loaded) {
+      logger.info('No valid memory found after scanning candidates; starting with fresh memory');
     }
   } catch (error) {
     logger.error('Failed to load memory; starting with fresh memory', error);
   }
-}
+} 
 
 async function saveMemory() {
   const dataStr = JSON.stringify(globalMemory);
@@ -250,6 +268,18 @@ async function saveMemory() {
       } catch (bakErr) {
         // non-fatal
       }
+
+      // Also attempt to persist a copy to the persistent directory (e.g., user's home)
+      try {
+        await fs.mkdir(PERSISTENT_DIR, { recursive: true });
+        await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', dataStr, 'utf8');
+        await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
+        try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
+        logger.info('Persistent copy saved', { persistent: PERSISTENT_MEMORY_FILE });
+      } catch (persistErr) {
+        logger.warn('Failed to save persistent copy of memory', { error: persistErr.message });
+      }
+
     } catch (statErr) {
       logger.info('Memory saved to disk');
     }
@@ -258,7 +288,7 @@ async function saveMemory() {
     try { await fs.unlink(tempFile); } catch (e) {}
     logger.error('Failed to save memory', error);
   }
-}
+} 
 
 // Optionally force synchronous saves after live learning (useful on platforms that may be killed abruptly)
 const FORCE_SYNC_ON_LEARN = process.env.FORCE_SYNC_ON_LEARN === '1';
@@ -279,6 +309,17 @@ function saveMemorySync() {
 
     // Create/overwrite a simple .bak backup to aid recovery
     try { fsSync.copyFileSync(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) { /* ignore backup errors */ }
+
+    // Also attempt to write a persistent copy (best-effort)
+    try {
+      fsSync.mkdirSync(PERSISTENT_DIR, { recursive: true });
+      const tempPersist = PERSISTENT_MEMORY_FILE + '.sync.tmp';
+      fsSync.writeFileSync(tempPersist, dataStr, 'utf8');
+      fsSync.renameSync(tempPersist, PERSISTENT_MEMORY_FILE);
+      try { fsSync.copyFileSync(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
+    } catch (e) {
+      // non-fatal
+    }
   } catch (error) {
     logger.error('Failed to sync save memory', error);
   }
