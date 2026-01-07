@@ -207,6 +207,11 @@ async function loadMemory() {
     // Make sure persistent dir exists (best-effort)
     try { await fs.mkdir(PERSISTENT_DIR, { recursive: true }); } catch (e) { /* ignore */ }
 
+    logger.info('Memory persistence sources', {
+      replitDbEnabled: Boolean(REPLIT_DB_URL),
+      persistentDir: PERSISTENT_DIR
+    });
+
     // Prefer Replit DB if configured (survives deployments)
     const dbData = await loadMemoryFromReplitDB();
     if (dbData) {
