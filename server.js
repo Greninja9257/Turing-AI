@@ -9,7 +9,11 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Persistent memory path (useful for platforms like Replit where project files may be overwritten)
-const PERSISTENT_DIR = process.env.PERSISTENT_MEMORY_DIR || path.join(os.homedir(), '.turing-ai');
+const IS_REPLIT = Boolean(process.env.REPL_ID || process.env.REPL_SLUG || process.env.REPLIT_DB_URL);
+const DEFAULT_PERSISTENT_DIR = IS_REPLIT
+  ? path.join(process.cwd(), '.turing-ai')
+  : path.join(os.homedir(), '.turing-ai');
+const PERSISTENT_DIR = process.env.PERSISTENT_MEMORY_DIR || DEFAULT_PERSISTENT_DIR;
 const PERSISTENT_MEMORY_FILE = path.join(PERSISTENT_DIR, 'memory.json');
 
 // Simple logger utility
