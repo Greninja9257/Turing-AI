@@ -15,6 +15,7 @@ const DEFAULT_PERSISTENT_DIR = IS_REPLIT
   : path.join(os.homedir(), '.turing-ai');
 const PERSISTENT_DIR = process.env.PERSISTENT_MEMORY_DIR || DEFAULT_PERSISTENT_DIR;
 const PERSISTENT_MEMORY_FILE = path.join(PERSISTENT_DIR, 'memory.json');
+const REPLIT_DB_URL = process.env.REPLIT_DB_URL;
 
 // Simple logger utility
 const logger = {
@@ -170,11 +171,77 @@ const activeSessions = new Map(); // sessionId -> lastActivity timestamp
 // Load memory from file on startup
 const MEMORY_FILE = path.join(__dirname, 'data', 'memory.json');
 
+async function loadMemoryFromReplitDB() {
+  if (!REPLIT_DB_URL) return null;
+  try {
+    const res = await fetch(`${REPLIT_DB_URL}/memory`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    if (!text || !text.trim()) return null;
+    return text;
+  } catch (err) {
+    logger.warn('Failed to read memory from Replit DB', { error: err.message });
+    return null;
+  }
+}
+
+async function saveMemoryToReplitDB(dataStr) {
+  if (!REPLIT_DB_URL) return;
+  try {
+    const res = await fetch(`${REPLIT_DB_URL}/memory`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: dataStr })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    logger.info('Persistent copy saved to Replit DB', { key: 'memory' });
+  } catch (err) {
+    logger.warn('Failed to save memory to Replit DB', { error: err.message });
+  }
+}
+
 async function loadMemory() {
   try {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
     // Make sure persistent dir exists (best-effort)
     try { await fs.mkdir(PERSISTENT_DIR, { recursive: true }); } catch (e) { /* ignore */ }
+
+    // Prefer Replit DB if configured (survives deployments)
+    const dbData = await loadMemoryFromReplitDB();
+    if (dbData) {
+      try {
+        const parsed = JSON.parse(dbData);
+        if (parsed && typeof parsed === 'object') {
+          globalMemory = parsed;
+          logger.info('Memory loaded from Replit DB', { source: 'replit-db', contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
+
+          // Sync chosen memory into primary and persistent locations (best-effort)
+          try {
+            await fs.writeFile(MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
+            await fs.rename(MEMORY_FILE + '.tmp', MEMORY_FILE);
+          } catch (e) {
+            logger.warn('Failed to sync memory to primary location', { error: e.message });
+          }
+
+          try {
+            await fs.mkdir(PERSISTENT_DIR, { recursive: true });
+            await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
+            await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
+          } catch (e) {
+            logger.warn('Failed to sync memory to persistent location', { error: e.message });
+          }
+
+          // Ensure backups exist (best-effort)
+          try { await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) {}
+          try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
+
+          return;
+        }
+      } catch (err) {
+        logger.warn('Failed to parse memory from Replit DB; falling back to files', { error: err.message });
+      }
+    }
 
     // Prefer persistent storage on platforms where project files reset (e.g. Replit)
     const candidatePaths = [
@@ -267,6 +334,9 @@ async function saveMemory() {
       } catch (persistErr) {
         logger.warn('Failed to save persistent copy of memory', { error: persistErr.message });
       }
+
+      // Also persist to Replit DB if configured (survives deployments)
+      await saveMemoryToReplitDB(dataStr);
 
     } catch (statErr) {
       logger.info('Memory saved to disk');
