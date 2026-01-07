@@ -4,6 +4,7 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 const os = require('os');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -16,6 +17,28 @@ const DEFAULT_PERSISTENT_DIR = IS_REPLIT
 const PERSISTENT_DIR = process.env.PERSISTENT_MEMORY_DIR || DEFAULT_PERSISTENT_DIR;
 const PERSISTENT_MEMORY_FILE = path.join(PERSISTENT_DIR, 'memory.json');
 const REPLIT_DB_URL = process.env.REPLIT_DB_URL;
+const POSTGRES_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRESQL_URL || process.env.POSTGRES_URI;
+
+const pgPool = POSTGRES_URL
+  ? new Pool({
+      connectionString: POSTGRES_URL,
+      ssl: (process.env.PGSSLMODE === 'require' || /sslmode=require/i.test(POSTGRES_URL))
+        ? { rejectUnauthorized: false }
+        : false
+    })
+  : null;
+
+let pgTableReady = null;
+
+async function ensurePostgresTable() {
+  if (!pgPool) return;
+  if (!pgTableReady) {
+    pgTableReady = pgPool.query(
+      'CREATE TABLE IF NOT EXISTS memory_store (id text PRIMARY KEY, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())'
+    );
+  }
+  await pgTableReady;
+}
 
 // Simple logger utility
 const logger = {
@@ -186,6 +209,22 @@ async function loadMemoryFromReplitDB() {
   }
 }
 
+async function loadMemoryFromPostgres() {
+  if (!pgPool) return null;
+  try {
+    await ensurePostgresTable();
+    const res = await pgPool.query('SELECT data FROM memory_store WHERE id = $1', ['global']);
+    if (res.rowCount === 0) return null;
+    const data = res.rows[0].data;
+    if (!data) return null;
+    if (typeof data === 'string') return data;
+    return JSON.stringify(data);
+  } catch (err) {
+    logger.warn('Failed to read memory from Postgres', { error: err.message });
+    return null;
+  }
+}
+
 async function saveMemoryToReplitDB(dataStr) {
   if (!REPLIT_DB_URL) return;
   try {
@@ -201,6 +240,20 @@ async function saveMemoryToReplitDB(dataStr) {
   }
 }
 
+async function saveMemoryToPostgres(dataStr) {
+  if (!pgPool) return;
+  try {
+    await ensurePostgresTable();
+    await pgPool.query(
+      'INSERT INTO memory_store (id, data, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()',
+      ['global', dataStr]
+    );
+    logger.info('Persistent copy saved to Postgres', { key: 'memory' });
+  } catch (err) {
+    logger.warn('Failed to save memory to Postgres', { error: err.message });
+  }
+}
+
 async function loadMemory() {
   try {
     await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
@@ -208,9 +261,46 @@ async function loadMemory() {
     try { await fs.mkdir(PERSISTENT_DIR, { recursive: true }); } catch (e) { /* ignore */ }
 
     logger.info('Memory persistence sources', {
+      postgresEnabled: Boolean(pgPool),
       replitDbEnabled: Boolean(REPLIT_DB_URL),
       persistentDir: PERSISTENT_DIR
     });
+
+    // Prefer Postgres if configured (survives deployments)
+    const pgData = await loadMemoryFromPostgres();
+    if (pgData) {
+      try {
+        const parsed = JSON.parse(pgData);
+        if (parsed && typeof parsed === 'object') {
+          globalMemory = parsed;
+          logger.info('Memory loaded from Postgres', { source: 'postgres', contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
+
+          // Sync chosen memory into primary and persistent locations (best-effort)
+          try {
+            await fs.writeFile(MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
+            await fs.rename(MEMORY_FILE + '.tmp', MEMORY_FILE);
+          } catch (e) {
+            logger.warn('Failed to sync memory to primary location', { error: e.message });
+          }
+
+          try {
+            await fs.mkdir(PERSISTENT_DIR, { recursive: true });
+            await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
+            await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
+          } catch (e) {
+            logger.warn('Failed to sync memory to persistent location', { error: e.message });
+          }
+
+          // Ensure backups exist (best-effort)
+          try { await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) {}
+          try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
+
+          return;
+        }
+      } catch (err) {
+        logger.warn('Failed to parse memory from Postgres; falling back to other sources', { error: err.message });
+      }
+    }
 
     // Prefer Replit DB if configured (survives deployments)
     const dbData = await loadMemoryFromReplitDB();
@@ -339,6 +429,9 @@ async function saveMemory() {
       } catch (persistErr) {
         logger.warn('Failed to save persistent copy of memory', { error: persistErr.message });
       }
+
+      // Also persist to Postgres if configured (survives deployments)
+      await saveMemoryToPostgres(dataStr);
 
       // Also persist to Replit DB if configured (survives deployments)
       await saveMemoryToReplitDB(dataStr);
