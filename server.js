@@ -5,19 +5,61 @@ const fsSync = require('fs');
 const path = require('path');
 const os = require('os');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Persistent memory path (useful for platforms like Replit where project files may be overwritten)
+// ============================================================================
+// CONFIGURATION & CONSTANTS
+// ============================================================================
+
+const CONFIG = {
+  // Rate limiting
+  RATE_LIMIT_WINDOW_MS: 60000,
+  RATE_LIMIT_MAX_REQUESTS: 60,
+  
+  // Message limits
+  MAX_MESSAGE_LENGTH: 2000,
+  MIN_MESSAGE_LENGTH: 1,
+  
+  // Memory & persistence
+  SAVE_INTERVAL_MS: parseInt(process.env.SAVE_INTERVAL_MS, 10) || 60000,
+  MAX_CONVERSATION_HISTORY: 10,
+  SESSION_TIMEOUT_MS: 5 * 60 * 1000,
+  MAX_SESSIONS: 1000,
+  
+  // Learning thresholds
+  MIN_QUALITY_SCORE: 40,
+  MIN_RELEVANCE_SCORE: 30,
+  
+  // CORS settings
+  ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '*').split(','),
+  
+  // Backup settings
+  BACKUP_INTERVAL_MS: 24 * 60 * 60 * 1000, // Daily backups
+  MAX_BACKUPS: 7,
+  
+  // Performance
+  ENABLE_COMPRESSION: true,
+  RESPONSE_CACHE_TTL_MS: 5000,
+};
+
+// Persistent memory configuration
 const IS_REPLIT = Boolean(process.env.REPL_ID || process.env.REPL_SLUG || process.env.REPLIT_DB_URL);
 const DEFAULT_PERSISTENT_DIR = IS_REPLIT
   ? path.join(process.cwd(), '.turing-ai')
   : path.join(os.homedir(), '.turing-ai');
 const PERSISTENT_DIR = process.env.PERSISTENT_MEMORY_DIR || DEFAULT_PERSISTENT_DIR;
 const PERSISTENT_MEMORY_FILE = path.join(PERSISTENT_DIR, 'memory.json');
+const BACKUP_DIR = path.join(PERSISTENT_DIR, 'backups');
 const REPLIT_DB_URL = process.env.REPLIT_DB_URL;
 const POSTGRES_URL = process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.POSTGRESQL_URL || process.env.POSTGRES_URI;
+const FORCE_SYNC_ON_LEARN = process.env.FORCE_SYNC_ON_LEARN === '1';
+
+// ============================================================================
+// DATABASE SETUP
+// ============================================================================
 
 const pgPool = POSTGRES_URL
   ? new Pool({
@@ -33,455 +75,287 @@ let pgTableReady = null;
 async function ensurePostgresTable() {
   if (!pgPool) return;
   if (!pgTableReady) {
-    pgTableReady = pgPool.query(
-      'CREATE TABLE IF NOT EXISTS memory_store (id text PRIMARY KEY, data jsonb NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())'
-    );
+    pgTableReady = pgPool.query(`
+      CREATE TABLE IF NOT EXISTS memory_store (
+        id text PRIMARY KEY,
+        data jsonb NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now(),
+        created_at timestamptz NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_updated ON memory_store(updated_at);
+    `);
   }
   await pgTableReady;
 }
 
-// Simple logger utility
-const logger = {
-  info: (msg, data = {}) => {
-    console.log(JSON.stringify({ level: 'INFO', time: new Date().toISOString(), msg, ...data }));
-  },
-  error: (msg, error, data = {}) => {
-    console.error(JSON.stringify({
-      level: 'ERROR',
+// ============================================================================
+// LOGGING UTILITY
+// ============================================================================
+
+class Logger {
+  constructor() {
+    this.requestId = null;
+  }
+
+  _log(level, msg, data = {}) {
+    const logEntry = {
+      level,
       time: new Date().toISOString(),
       msg,
+      requestId: this.requestId,
+      ...data
+    };
+    
+    const output = JSON.stringify(logEntry);
+    
+    if (level === 'ERROR') {
+      console.error(output);
+    } else if (level === 'WARN') {
+      console.warn(output);
+    } else {
+      console.log(output);
+    }
+  }
+
+  info(msg, data = {}) {
+    this._log('INFO', msg, data);
+  }
+
+  error(msg, error, data = {}) {
+    this._log('ERROR', msg, {
       error: error?.message || error,
       stack: error?.stack,
       ...data
-    }));
-  },
-  warn: (msg, data = {}) => {
-    console.warn(JSON.stringify({ level: 'WARN', time: new Date().toISOString(), msg, ...data }));
-  }
-};
-
-// Rate limiting
-const rateLimits = new Map(); // IP -> { count, resetTime }
-const RATE_LIMIT_WINDOW = 60000; // 1 minute
-const RATE_LIMIT_MAX = 60; // 60 requests per minute per IP
-
-function checkRateLimit(ip) {
-  const now = Date.now();
-  const limit = rateLimits.get(ip);
-
-  if (!limit || now > limit.resetTime) {
-    rateLimits.set(ip, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
-    return true;
-  }
-
-  if (limit.count >= RATE_LIMIT_MAX) {
-    return false;
-  }
-
-  limit.count++;
-  return true;
-}
-
-// Write queue to prevent race conditions
-let saveQueue = Promise.resolve();
-let saveScheduled = false;
-
-function queueSave() {
-  if (saveScheduled) return; // Already scheduled
-  saveScheduled = true;
-
-  // Schedule save on next tick to batch multiple rapid calls
-  setImmediate(() => {
-    saveQueue = saveQueue.then(async () => {
-      saveScheduled = false;
-      await saveMemory();
-      logger.info('Memory saved to disk');
-    }).catch(err => {
-      saveScheduled = false;
-      logger.error('Queued save failed', err);
     });
-  });
-}
-
-// Graceful shutdown - save memory before exit
-async function gracefulShutdown(signal) {
-  logger.info('Shutdown signal received', { signal });
-
-  try {
-    // Wait for any pending saves
-    await saveQueue;
-    // Force final save (async)
-    await saveMemory();
-    logger.info('Final memory save completed');
-  } catch (err) {
-    logger.error('Error during shutdown save', err);
   }
 
-  // As a last-resort, attempt a synchronous save to avoid loss on abrupt exits (best-effort)
-  try {
-    const syncTemp = MEMORY_FILE + '.sync.tmp';
-    fsSync.writeFileSync(syncTemp, JSON.stringify(globalMemory), 'utf8');
-    fsSync.renameSync(syncTemp, MEMORY_FILE);
-    logger.info('Synchronous final memory save completed');
-  } catch (syncErr) {
-    logger.error('Synchronous final save failed', syncErr);
+  warn(msg, data = {}) {
+    this._log('WARN', msg, data);
   }
 
-  process.exit(0);
-}
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2')); // nodemon restart
-
-// Middleware
-app.use(bodyParser.json({ limit: '50mb' }));
-
-// Rate limiting middleware
-app.use((req, res, next) => {
-  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
-
-  if (!checkRateLimit(ip)) {
-    logger.warn('Rate limit exceeded', { ip, path: req.path });
-    return res.status(429).json({ error: 'Too many requests' });
-  }
-
-  next();
-});
-
-// CORS middleware - allow requests from anywhere (needed for trainer.html)
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type');
-  
-  // Handle preflight
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  
-  next();
-});
-
-app.use(express.static('public'));
-
-// Serve index.html at root
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// In-memory storage with file persistence
-let globalMemory = {
-  patterns: {},           // Pattern-based learning
-  contextPairs: [],       // High-quality context-response pairs
-  semanticClusters: {},   // Grouped similar concepts
-  qualityScores: {},      // Track quality of learned content
-  stats: {
-    totalMessages: 0,
-    totalConversations: 0,
-    trainingDataPoints: 0,
-    garbageFiltered: 0,
-    liveConversationsLearned: 0
-  }
-};
-
-// Store recent conversations for learning
-const conversationBuffer = new Map(); // userId -> conversation history
-
-// Track active sessions (sessions active in last 5 minutes)
-const activeSessions = new Map(); // sessionId -> lastActivity timestamp
-
-// Load memory from file on startup
-const MEMORY_FILE = path.join(__dirname, 'data', 'memory.json');
-
-async function loadMemoryFromReplitDB() {
-  if (!REPLIT_DB_URL) return null;
-  try {
-    const res = await fetch(`${REPLIT_DB_URL}/memory`);
-    if (res.status === 404) return null;
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const text = await res.text();
-    if (!text || !text.trim()) return null;
-    return text;
-  } catch (err) {
-    logger.warn('Failed to read memory from Replit DB', { error: err.message });
-    return null;
+  setRequestId(id) {
+    this.requestId = id;
+    return this;
   }
 }
 
-async function loadMemoryFromPostgres() {
-  if (!pgPool) return null;
-  try {
-    await ensurePostgresTable();
-    const res = await pgPool.query('SELECT data FROM memory_store WHERE id = $1', ['global']);
-    if (res.rowCount === 0) return null;
-    const data = res.rows[0].data;
-    if (!data) return null;
-    if (typeof data === 'string') return data;
-    return JSON.stringify(data);
-  } catch (err) {
-    logger.warn('Failed to read memory from Postgres', { error: err.message });
-    return null;
+const logger = new Logger();
+
+// ============================================================================
+// METRICS COLLECTION
+// ============================================================================
+
+class MetricsCollector {
+  constructor() {
+    this.metrics = {
+      requestCount: 0,
+      errorCount: 0,
+      totalResponseTime: 0,
+      learningCount: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      startTime: Date.now()
+    };
+  }
+
+  recordRequest(duration, hasError = false) {
+    this.metrics.requestCount++;
+    this.metrics.totalResponseTime += duration;
+    if (hasError) this.metrics.errorCount++;
+  }
+
+  recordLearning() {
+    this.metrics.learningCount++;
+  }
+
+  recordCacheHit() {
+    this.metrics.cacheHits++;
+  }
+
+  recordCacheMiss() {
+    this.metrics.cacheMisses++;
+  }
+
+  getMetrics() {
+    const avgResponseTime = this.metrics.requestCount > 0
+      ? this.metrics.totalResponseTime / this.metrics.requestCount
+      : 0;
+
+    return {
+      ...this.metrics,
+      avgResponseTime: Math.round(avgResponseTime),
+      uptime: Date.now() - this.metrics.startTime,
+      errorRate: this.metrics.requestCount > 0
+        ? (this.metrics.errorCount / this.metrics.requestCount) * 100
+        : 0
+    };
   }
 }
 
-async function saveMemoryToReplitDB(dataStr) {
-  if (!REPLIT_DB_URL) return;
-  try {
-    const res = await fetch(`${REPLIT_DB_URL}/memory`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value: dataStr })
+const metrics = new MetricsCollector();
+
+// ============================================================================
+// RESPONSE CACHE
+// ============================================================================
+
+class ResponseCache {
+  constructor(ttl = CONFIG.RESPONSE_CACHE_TTL_MS) {
+    this.cache = new Map();
+    this.ttl = ttl;
+  }
+
+  _hash(message) {
+    return crypto.createHash('md5').update(message.toLowerCase().trim()).digest('hex');
+  }
+
+  get(message) {
+    const key = this._hash(message);
+    const entry = this.cache.get(key);
+    
+    if (!entry) return null;
+    
+    if (Date.now() - entry.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    return entry.response;
+  }
+
+  set(message, response) {
+    const key = this._hash(message);
+    this.cache.set(key, {
+      response,
+      timestamp: Date.now()
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    logger.info('Persistent copy saved to Replit DB', { key: 'memory' });
-  } catch (err) {
-    logger.warn('Failed to save memory to Replit DB', { error: err.message });
+    
+    // Limit cache size
+    if (this.cache.size > 1000) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+  }
+
+  clear() {
+    this.cache.clear();
   }
 }
 
-async function saveMemoryToPostgres(dataStr) {
-  if (!pgPool) return;
-  try {
-    await ensurePostgresTable();
-    await pgPool.query(
-      'INSERT INTO memory_store (id, data, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()',
-      ['global', dataStr]
-    );
-    logger.info('Persistent copy saved to Postgres', { key: 'memory' });
-  } catch (err) {
-    logger.warn('Failed to save memory to Postgres', { error: err.message });
+const responseCache = new ResponseCache();
+
+// ============================================================================
+// RATE LIMITING
+// ============================================================================
+
+class RateLimiter {
+  constructor() {
+    this.limits = new Map();
   }
-}
 
-async function loadMemory() {
-  try {
-    await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
-    // Make sure persistent dir exists (best-effort)
-    try { await fs.mkdir(PERSISTENT_DIR, { recursive: true }); } catch (e) { /* ignore */ }
+  check(identifier) {
+    const now = Date.now();
+    const limit = this.limits.get(identifier);
 
-    logger.info('Memory persistence sources', {
-      postgresEnabled: Boolean(pgPool),
-      replitDbEnabled: Boolean(REPLIT_DB_URL),
-      persistentDir: PERSISTENT_DIR
-    });
-
-    // Prefer Postgres if configured (survives deployments)
-    const pgData = await loadMemoryFromPostgres();
-    if (pgData) {
-      try {
-        const parsed = JSON.parse(pgData);
-        if (parsed && typeof parsed === 'object') {
-          globalMemory = parsed;
-          logger.info('Memory loaded from Postgres', { source: 'postgres', contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
-
-          // Sync chosen memory into primary and persistent locations (best-effort)
-          try {
-            await fs.writeFile(MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
-            await fs.rename(MEMORY_FILE + '.tmp', MEMORY_FILE);
-          } catch (e) {
-            logger.warn('Failed to sync memory to primary location', { error: e.message });
-          }
-
-          try {
-            await fs.mkdir(PERSISTENT_DIR, { recursive: true });
-            await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
-            await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
-          } catch (e) {
-            logger.warn('Failed to sync memory to persistent location', { error: e.message });
-          }
-
-          // Ensure backups exist (best-effort)
-          try { await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) {}
-          try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
-
-          return;
-        }
-      } catch (err) {
-        logger.warn('Failed to parse memory from Postgres; falling back to other sources', { error: err.message });
-      }
+    if (!limit || now > limit.resetTime) {
+      this.limits.set(identifier, {
+        count: 1,
+        resetTime: now + CONFIG.RATE_LIMIT_WINDOW_MS
+      });
+      return { allowed: true, remaining: CONFIG.RATE_LIMIT_MAX_REQUESTS - 1 };
     }
 
-    // Prefer Replit DB if configured (survives deployments)
-    const dbData = await loadMemoryFromReplitDB();
-    if (dbData) {
-      try {
-        const parsed = JSON.parse(dbData);
-        if (parsed && typeof parsed === 'object') {
-          globalMemory = parsed;
-          logger.info('Memory loaded from Replit DB', { source: 'replit-db', contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
-
-          // Sync chosen memory into primary and persistent locations (best-effort)
-          try {
-            await fs.writeFile(MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
-            await fs.rename(MEMORY_FILE + '.tmp', MEMORY_FILE);
-          } catch (e) {
-            logger.warn('Failed to sync memory to primary location', { error: e.message });
-          }
-
-          try {
-            await fs.mkdir(PERSISTENT_DIR, { recursive: true });
-            await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
-            await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
-          } catch (e) {
-            logger.warn('Failed to sync memory to persistent location', { error: e.message });
-          }
-
-          // Ensure backups exist (best-effort)
-          try { await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) {}
-          try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
-
-          return;
-        }
-      } catch (err) {
-        logger.warn('Failed to parse memory from Replit DB; falling back to files', { error: err.message });
-      }
+    if (limit.count >= CONFIG.RATE_LIMIT_MAX_REQUESTS) {
+      return {
+        allowed: false,
+        remaining: 0,
+        resetTime: limit.resetTime
+      };
     }
 
-    // Prefer persistent storage on platforms where project files reset (e.g. Replit)
-    const candidatePaths = [
-      PERSISTENT_MEMORY_FILE,
-      PERSISTENT_MEMORY_FILE + '.bak',
-      MEMORY_FILE,
-      MEMORY_FILE + '.bak'
+    limit.count++;
+    return {
+      allowed: true,
+      remaining: CONFIG.RATE_LIMIT_MAX_REQUESTS - limit.count
+    };
+  }
+
+  cleanup() {
+    const now = Date.now();
+    let cleaned = 0;
+    
+    for (const [key, limit] of this.limits.entries()) {
+      if (now > limit.resetTime) {
+        this.limits.delete(key);
+        cleaned++;
+      }
+    }
+    
+    if (cleaned > 0) {
+      logger.info('Rate limiter cleanup', { cleaned });
+    }
+  }
+}
+
+const rateLimiter = new RateLimiter();
+
+// Cleanup rate limiter every 5 minutes
+setInterval(() => rateLimiter.cleanup(), 5 * 60 * 1000);
+
+// ============================================================================
+// INPUT VALIDATION & SANITIZATION
+// ============================================================================
+
+class InputValidator {
+  static validateMessage(message) {
+    if (typeof message !== 'string') {
+      return { valid: false, error: 'Message must be a string' };
+    }
+
+    const trimmed = message.trim();
+
+    if (trimmed.length < CONFIG.MIN_MESSAGE_LENGTH) {
+      return { valid: false, error: 'Message is too short' };
+    }
+
+    if (trimmed.length > CONFIG.MAX_MESSAGE_LENGTH) {
+      return { valid: false, error: `Message exceeds maximum length of ${CONFIG.MAX_MESSAGE_LENGTH} characters` };
+    }
+
+    // Check for suspicious patterns (potential attacks)
+    const suspiciousPatterns = [
+      /<script/i,
+      /javascript:/i,
+      /on\w+\s*=/i, // Event handlers
+      /data:text\/html/i,
     ];
 
-    let loaded = false;
-
-    for (const candidatePath of candidatePaths) {
-      try {
-        const data = await fs.readFile(candidatePath, 'utf8');
-        if (!data || !data.trim()) continue;
-
-        const parsed = JSON.parse(data);
-        if (parsed && typeof parsed === 'object') {
-          globalMemory = parsed;
-          logger.info('Memory loaded from disk', { source: candidatePath, contextPairs: globalMemory.contextPairs?.length || 0, semanticClusters: Object.keys(globalMemory.semanticClusters || {}).length });
-
-          // Sync chosen memory into primary and persistent locations (best-effort)
-          try {
-            await fs.writeFile(MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
-            await fs.rename(MEMORY_FILE + '.tmp', MEMORY_FILE);
-          } catch (e) {
-            logger.warn('Failed to sync memory to primary location', { error: e.message });
-          }
-
-          try {
-            await fs.mkdir(PERSISTENT_DIR, { recursive: true });
-            await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', JSON.stringify(globalMemory), 'utf8');
-            await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
-          } catch (e) {
-            // non-fatal
-            logger.warn('Failed to sync memory to persistent location', { error: e.message });
-          }
-
-          // Ensure backups exist (best-effort)
-          try { await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) {}
-          try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
-
-          loaded = true;
-          break;
-        }
-      } catch (err) {
-        if (err && err.code === 'ENOENT') {
-          continue;
-        }
-        logger.warn('Failed to parse or read candidate memory file; continuing', { file: candidatePath, error: err.message });
-        continue;
+    for (const pattern of suspiciousPatterns) {
+      if (pattern.test(message)) {
+        return { valid: false, error: 'Message contains suspicious content' };
       }
     }
 
-    if (!loaded) {
-      logger.info('No valid memory found after scanning candidates; starting with fresh memory');
-    }
-  } catch (error) {
-    logger.error('Failed to load memory; starting with fresh memory', error);
+    return { valid: true, message: trimmed };
   }
-} 
 
-async function saveMemory() {
-  const dataStr = JSON.stringify(globalMemory);
-  const tempFile = MEMORY_FILE + '.tmp';
-  try {
-    await fs.mkdir(path.join(__dirname, 'data'), { recursive: true });
-    await fs.writeFile(tempFile, dataStr, 'utf8');
-    await fs.rename(tempFile, MEMORY_FILE);
-
-    try {
-      const stats = await fs.stat(MEMORY_FILE);
-      logger.info('Memory saved to disk', { bytes: stats.size });
-
-      // Create a simple rotating backup (overwrite .bak) to help recovery on abrupt resets
-      try {
-        await fs.copyFile(MEMORY_FILE, MEMORY_FILE + '.bak');
-        logger.info('Backup saved', { backup: MEMORY_FILE + '.bak' });
-      } catch (bakErr) {
-        // non-fatal
-      }
-
-      // Also attempt to persist a copy to the persistent directory (e.g., user's home)
-      try {
-        await fs.mkdir(PERSISTENT_DIR, { recursive: true });
-        await fs.writeFile(PERSISTENT_MEMORY_FILE + '.tmp', dataStr, 'utf8');
-        await fs.rename(PERSISTENT_MEMORY_FILE + '.tmp', PERSISTENT_MEMORY_FILE);
-        try { await fs.copyFile(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
-        logger.info('Persistent copy saved', { persistent: PERSISTENT_MEMORY_FILE });
-      } catch (persistErr) {
-        logger.warn('Failed to save persistent copy of memory', { error: persistErr.message });
-      }
-
-      // Also persist to Postgres if configured (survives deployments)
-      await saveMemoryToPostgres(dataStr);
-
-      // Also persist to Replit DB if configured (survives deployments)
-      await saveMemoryToReplitDB(dataStr);
-
-    } catch (statErr) {
-      logger.info('Memory saved to disk');
-    }
-  } catch (error) {
-    // Try to clean up temp file if present
-    try { await fs.unlink(tempFile); } catch (e) {}
-    logger.error('Failed to save memory', error);
-  }
-} 
-
-// Optionally force synchronous saves after live learning (useful on platforms that may be killed abruptly)
-const FORCE_SYNC_ON_LEARN = process.env.FORCE_SYNC_ON_LEARN === '1';
-
-function saveMemorySync() {
-  try {
-    const dataStr = JSON.stringify(globalMemory);
-    const tempFile = MEMORY_FILE + '.sync.tmp';
-    fsSync.writeFileSync(tempFile, dataStr, 'utf8');
-    fsSync.renameSync(tempFile, MEMORY_FILE);
-
-    try {
-      const stats = fsSync.statSync(MEMORY_FILE);
-      logger.info('Sync memory saved to disk', { bytes: stats.size });
-    } catch (e) {
-      logger.info('Sync memory saved to disk');
+  static validateSessionId(sessionId) {
+    if (typeof sessionId !== 'string') {
+      return { valid: false, error: 'Session ID must be a string' };
     }
 
-    // Create/overwrite a simple .bak backup to aid recovery
-    try { fsSync.copyFileSync(MEMORY_FILE, MEMORY_FILE + '.bak'); } catch (e) { /* ignore backup errors */ }
-
-    // Also attempt to write a persistent copy (best-effort)
-    try {
-      fsSync.mkdirSync(PERSISTENT_DIR, { recursive: true });
-      const tempPersist = PERSISTENT_MEMORY_FILE + '.sync.tmp';
-      fsSync.writeFileSync(tempPersist, dataStr, 'utf8');
-      fsSync.renameSync(tempPersist, PERSISTENT_MEMORY_FILE);
-      try { fsSync.copyFileSync(PERSISTENT_MEMORY_FILE, PERSISTENT_MEMORY_FILE + '.bak'); } catch (e) {}
-    } catch (e) {
-      // non-fatal
+    // Session ID should be alphanumeric with underscores
+    if (!/^[a-zA-Z0-9_-]{1,100}$/.test(sessionId)) {
+      return { valid: false, error: 'Invalid session ID format' };
     }
-  } catch (error) {
-    logger.error('Failed to sync save memory', error);
+
+    return { valid: true, sessionId };
   }
 }
 
-// Text cleaning utility
+// ============================================================================
+// TEXT PROCESSING UTILITIES
+// ============================================================================
+
 class TextCleaner {
   static clean(text) {
     if (!text) return '';
@@ -499,15 +373,18 @@ class TextCleaner {
     // Remove leading/trailing quotes that might be artifacts
     cleaned = cleaned.replace(/^["']|["']$/g, '');
     
-    // Clean up extra whitespace
+    // Normalize whitespace
     cleaned = cleaned.replace(/\s+/g, ' ').trim();
     
-    return cleaned;
+    return cleaned.substring(0, CONFIG.MAX_MESSAGE_LENGTH);
+  }
+
+  static normalize(text) {
+    return text.toLowerCase().trim();
   }
 }
 
-// Garbage classification system
-// Profanity helpers (normalization + simple deobfuscation)
+// Profanity detection with leet-speak and obfuscation handling
 const DEFAULT_BANNED_WORDS = new Set([
   'fuck','fucker','fucking','shit','bitch','bastard','asshole','dick','douche','cunt','whore','slut',
   'nigger','nigga','faggot','fag','retard','spaz','kys'
@@ -516,11 +393,14 @@ const DEFAULT_BANNED_WORDS = new Set([
 function normalizeForProfanity(text) {
   if (!text) return { original: '', lettersOnly: '', collapsed: '' };
   let normalized = text.normalize('NFKC').toLowerCase();
-  normalized = normalized.replace(/\p{M}/gu, ''); // remove diacritics
+  
+  // Remove diacritics
+  normalized = normalized.replace(/\p{M}/gu, '');
 
-  const leetMap = { '4': 'a', '@': 'a', '3': 'e', '1': 'i', '!': 'i', '0': 'o', '\$': 's', '5': 's', '7': 't', '8': 'b' };
+  // Handle leet speak
+  const leetMap = { '4': 'a', '@': 'a', '3': 'e', '1': 'i', '!': 'i', '0': 'o', '$': 's', '5': 's', '7': 't', '8': 'b' };
   for (const [k, v] of Object.entries(leetMap)) {
-    normalized = normalized.replace(new RegExp(k, 'g'), v);
+    normalized = normalized.replace(new RegExp(k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), v);
   }
 
   const lettersOnly = normalized.replace(/[^a-z]/g, '');
@@ -533,11 +413,13 @@ function containsProfanity(text) {
   const lower = text.toLowerCase();
   const matches = new Set();
 
+  // Direct word boundary matching
   for (const word of DEFAULT_BANNED_WORDS) {
-    const re = new RegExp('\\b' + word.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&') + '\\b', 'i');
+    const re = new RegExp('\\b' + word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i');
     if (re.test(lower)) matches.add(word);
   }
 
+  // Check obfuscated versions
   const { lettersOnly, collapsed } = normalizeForProfanity(text);
   for (const word of DEFAULT_BANNED_WORDS) {
     if (collapsed.includes(word) || lettersOnly.includes(word)) matches.add(word);
@@ -545,6 +427,7 @@ function containsProfanity(text) {
 
   return { found: matches.size > 0, matches: Array.from(matches) };
 }
+
 class GarbageClassifier {
   static isGarbage(text) {
     const lower = text.toLowerCase().trim();
@@ -565,8 +448,8 @@ class GarbageClassifier {
       /free money/i,
       /\b(viagra|cialis|casino)\b/i,
       /http[s]?:\/\/[^\s]{20,}/i, // Long URLs
-      /(.)\1{5,}/, // Repeated characters (stricter)
-      /\d{5,}/, // Long number sequences (stricter)
+      /(.)\1{5,}/, // Repeated characters
+      /\d{5,}/, // Long number sequences
       /\b(subscribe|follow me|check out my)\b/i,
     ];
 
@@ -579,7 +462,7 @@ class GarbageClassifier {
 
     if (harmfulPatterns.some(pattern => pattern.test(text))) return true;
 
-    // Centralized profanity detection (handles obfuscation and leet)
+    // Centralized profanity detection
     const profanity = containsProfanity(text);
     if (profanity.found) return true;
 
@@ -588,16 +471,18 @@ class GarbageClassifier {
     const upperWords = words.filter(w => w === w.toUpperCase() && w.length > 1);
     if (upperWords.length / words.length > 0.6) return true;
 
-    // Don't filter single-word responses - humans use them naturally
-    // Allow: ok, yeah, lol, cool, nice, etc.
-
-    // Filter gibberish - too few vowels
+    // Filter gibberish - too few vowels (but allow short common responses)
+    // Don't apply vowel check to very short messages (1-3 chars like "ok", "hi", "no")
     const vowelRatio = (lower.match(/[aeiou]/g) || []).length / lower.length;
-    if (vowelRatio < 0.15 && lower.length > 3) return true;
+    if (vowelRatio < 0.15 && lower.length > 4) return true;
 
     return false;
   }
-  
+
+  static containsProfanity(text) {
+    return containsProfanity(text);
+  }
+
   static calculateQuality(input, response) {
     let score = 50; // Base score - accept natural conversation
 
@@ -621,11 +506,21 @@ class GarbageClassifier {
   }
 }
 
-// Intelligent learning system
+// ============================================================================
+// INTELLIGENT LEARNING SYSTEM
+// ============================================================================
+
 class IntelligentLearner {
   static extractKeywords(text) {
     // Remove common stop words
-    const stopWords = new Set(['the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which', 'who', 'when', 'where', 'why', 'how']);
+    const stopWords = new Set([
+      'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 
+      'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been', 
+      'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 
+      'could', 'should', 'may', 'might', 'can', 'this', 'that', 'these', 
+      'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what', 'which', 
+      'who', 'when', 'where', 'why', 'how'
+    ]);
     
     const words = text.toLowerCase()
       .replace(/[^a-z0-9\s]/g, '')
@@ -634,7 +529,7 @@ class IntelligentLearner {
     
     return [...new Set(words)];
   }
-  
+
   static learnPattern(input, response, quality) {
     const keywords = this.extractKeywords(input);
     const inputLower = input.toLowerCase();
@@ -688,9 +583,9 @@ class IntelligentLearner {
 
       // Keep only top 20 highest quality responses per keyword
       globalMemory.semanticClusters[keyword].sort((a, b) => {
-        const scoreA = b.quality * (b.confidence || 1);
-        const scoreB = a.quality * (a.confidence || 1);
-        return scoreA - scoreB;
+        const scoreA = a.quality * (a.confidence || 1);
+        const scoreB = b.quality * (b.confidence || 1);
+        return scoreB - scoreA;
       });
       if (globalMemory.semanticClusters[keyword].length > 20) {
         globalMemory.semanticClusters[keyword] = globalMemory.semanticClusters[keyword].slice(0, 20);
@@ -724,6 +619,7 @@ class IntelligentLearner {
           }
         }
       } else {
+        // New high-quality pair
         globalMemory.contextPairs.push({
           input: inputLower,
           response,
@@ -733,7 +629,7 @@ class IntelligentLearner {
         });
       }
 
-      // Keep only top 1000 context pairs by quality * confidence
+      // Limit to top 1000 pairs
       if (globalMemory.contextPairs.length > 1000) {
         globalMemory.contextPairs.sort((a, b) => {
           const scoreA = b.quality * (b.confidence || 1);
@@ -743,9 +639,20 @@ class IntelligentLearner {
         globalMemory.contextPairs = globalMemory.contextPairs.slice(0, 1000);
       }
     }
+
+    // Update quality scores
+    globalMemory.qualityScores[inputLower] = quality;
   }
-  
+
   static findBestResponse(input) {
+    // Optional caching layer (improvement over original)
+    const cached = responseCache.get(input);
+    if (cached) {
+      metrics.recordCacheHit();
+      return cached;
+    }
+    metrics.recordCacheMiss();
+
     const keywords = this.extractKeywords(input);
     const inputLower = input.toLowerCase();
     
@@ -755,7 +662,11 @@ class IntelligentLearner {
     const exactMatch = globalMemory.contextPairs.find(pair => 
       pair.input === inputLower
     );
-    if (exactMatch) return exactMatch.response;
+    if (exactMatch) {
+      // Cache the result before returning
+      responseCache.set(input, exactMatch.response);
+      return exactMatch.response;
+    }
     
     // 2. Try semantic cluster matching
     keywords.forEach(keyword => {
@@ -781,7 +692,10 @@ class IntelligentLearner {
       
       // Return if high enough confidence
       if (scored[0].relevanceScore > 30) {
-        return scored[0].response;
+        const response = scored[0].response;
+        // Cache the result before returning
+        responseCache.set(input, response);
+        return response;
       }
     }
     
@@ -789,149 +703,605 @@ class IntelligentLearner {
   }
 }
 
-// API Endpoints
+// ============================================================================
+// SESSION MANAGEMENT
+// ============================================================================
+
+class SessionManager {
+  constructor() {
+    this.sessions = new Map();
+    this.conversationBuffer = new Map();
+  }
+
+  updateActivity(sessionId) {
+    this.sessions.set(sessionId, Date.now());
+  }
+
+  getConversationHistory(sessionId) {
+    if (!this.conversationBuffer.has(sessionId)) {
+      this.conversationBuffer.set(sessionId, []);
+    }
+    return this.conversationBuffer.get(sessionId);
+  }
+
+  addToHistory(sessionId, userMessage, aiResponse) {
+    const history = this.getConversationHistory(sessionId);
+    history.push({
+      user: userMessage,
+      ai: aiResponse,
+      timestamp: Date.now()
+    });
+
+    // Keep only recent history
+    if (history.length > CONFIG.MAX_CONVERSATION_HISTORY) {
+      history.shift();
+    }
+  }
+
+  cleanup() {
+    const cutoff = Date.now() - CONFIG.SESSION_TIMEOUT_MS;
+    let cleaned = 0;
+
+    for (const [sessionId, lastActivity] of this.sessions.entries()) {
+      if (lastActivity < cutoff) {
+        this.sessions.delete(sessionId);
+        this.conversationBuffer.delete(sessionId);
+        cleaned++;
+      }
+    }
+
+    if (cleaned > 0) {
+      logger.info('Session cleanup', { cleaned, active: this.sessions.size });
+    }
+
+    // Enforce max sessions limit
+    if (this.sessions.size > CONFIG.MAX_SESSIONS) {
+      const entries = Array.from(this.sessions.entries())
+        .sort((a, b) => a[1] - b[1]);
+      
+      const toRemove = entries.slice(0, entries.length - CONFIG.MAX_SESSIONS);
+      for (const [sessionId] of toRemove) {
+        this.sessions.delete(sessionId);
+        this.conversationBuffer.delete(sessionId);
+      }
+      
+      logger.warn('Session limit enforced', { removed: toRemove.length });
+    }
+  }
+
+  getActiveCount() {
+    return this.sessions.size;
+  }
+}
+
+const sessionManager = new SessionManager();
+
+// Cleanup sessions every minute
+setInterval(() => sessionManager.cleanup(), 60 * 1000);
+
+// ============================================================================
+// MEMORY PERSISTENCE
+// ============================================================================
+
+let globalMemory = {
+  patterns: {},
+  contextPairs: [],
+  semanticClusters: {},
+  qualityScores: {},
+  stats: {
+    totalMessages: 0,
+    totalConversations: 0,
+    trainingDataPoints: 0,
+    garbageFiltered: 0,
+    liveConversationsLearned: 0
+  }
+};
+
+let saveQueue = Promise.resolve();
+let saveScheduled = false;
+
+const MEMORY_FILE = path.join(__dirname, 'data', 'memory.json');
+
+async function ensureDirectories() {
+  await fs.mkdir(path.dirname(MEMORY_FILE), { recursive: true });
+  await fs.mkdir(PERSISTENT_DIR, { recursive: true });
+  await fs.mkdir(BACKUP_DIR, { recursive: true });
+}
+
+async function loadMemoryFromReplitDB() {
+  if (!REPLIT_DB_URL) return null;
+  try {
+    const res = await fetch(`${REPLIT_DB_URL}/memory`);
+    if (res.status === 404) return null;
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    return text && text.trim() ? text : null;
+  } catch (err) {
+    logger.warn('Failed to read memory from Replit DB', { error: err.message });
+    return null;
+  }
+}
+
+async function loadMemoryFromPostgres() {
+  if (!pgPool) return null;
+  try {
+    await ensurePostgresTable();
+    const res = await pgPool.query('SELECT data FROM memory_store WHERE id = $1', ['global']);
+    if (res.rowCount === 0) return null;
+    const data = res.rows[0].data;
+    if (!data) return null;
+    return typeof data === 'string' ? data : JSON.stringify(data);
+  } catch (err) {
+    logger.warn('Failed to read memory from Postgres', { error: err.message });
+    return null;
+  }
+}
+
+async function saveMemoryToReplitDB(dataStr) {
+  if (!REPLIT_DB_URL) return;
+  try {
+    const res = await fetch(`${REPLIT_DB_URL}/memory`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value: dataStr })
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    logger.info('Memory saved to Replit DB');
+  } catch (err) {
+    logger.warn('Failed to save memory to Replit DB', { error: err.message });
+  }
+}
+
+async function saveMemoryToPostgres(dataStr) {
+  if (!pgPool) return;
+  try {
+    await ensurePostgresTable();
+    await pgPool.query(
+      'INSERT INTO memory_store (id, data, updated_at) VALUES ($1, $2::jsonb, now()) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()',
+      ['global', dataStr]
+    );
+    logger.info('Memory saved to Postgres');
+  } catch (err) {
+    logger.warn('Failed to save memory to Postgres', { error: err.message });
+  }
+}
+
+async function loadMemory() {
+  await ensureDirectories();
+
+  try {
+    // Try loading from various sources in priority order
+    let memoryStr = await loadMemoryFromPostgres();
+    
+    if (!memoryStr) {
+      memoryStr = await loadMemoryFromReplitDB();
+    }
+    
+    if (!memoryStr) {
+      try {
+        memoryStr = await fs.readFile(PERSISTENT_MEMORY_FILE, 'utf8');
+      } catch (err) {
+        // File doesn't exist yet
+      }
+    }
+    
+    if (!memoryStr) {
+      try {
+        memoryStr = await fs.readFile(MEMORY_FILE, 'utf8');
+      } catch (err) {
+        // File doesn't exist yet
+      }
+    }
+
+    if (memoryStr) {
+      const loaded = JSON.parse(memoryStr);
+      
+      // Validate loaded data structure
+      if (loaded.stats && loaded.contextPairs && loaded.semanticClusters) {
+        globalMemory = loaded;
+        logger.info('Memory loaded successfully', {
+          contextPairs: globalMemory.contextPairs.length,
+          clusters: Object.keys(globalMemory.semanticClusters).length,
+          stats: globalMemory.stats
+        });
+      } else {
+        logger.warn('Invalid memory structure, using defaults');
+      }
+    } else {
+      logger.info('No existing memory found, starting fresh');
+    }
+  } catch (error) {
+    logger.error('Error loading memory', error);
+  }
+}
+
+async function saveMemory() {
+  try {
+    const memoryStr = JSON.stringify(globalMemory, null, 2);
+
+    // Save to primary file
+    const tempFile = MEMORY_FILE + '.tmp';
+    await fs.writeFile(tempFile, memoryStr, 'utf8');
+    await fs.rename(tempFile, MEMORY_FILE);
+
+    // Save to persistent location
+    const persistentTemp = PERSISTENT_MEMORY_FILE + '.tmp';
+    await fs.writeFile(persistentTemp, memoryStr, 'utf8');
+    await fs.rename(persistentTemp, PERSISTENT_MEMORY_FILE);
+
+    // Save to external stores (non-blocking)
+    saveMemoryToPostgres(memoryStr).catch(err => 
+      logger.error('Postgres save failed', err)
+    );
+    saveMemoryToReplitDB(memoryStr).catch(err => 
+      logger.error('Replit DB save failed', err)
+    );
+
+    logger.info('Memory saved successfully');
+  } catch (error) {
+    logger.error('Failed to save memory', error);
+    throw error;
+  }
+}
+
+function saveMemorySync() {
+  try {
+    const memoryStr = JSON.stringify(globalMemory);
+    const tempFile = MEMORY_FILE + '.sync.tmp';
+    fsSync.writeFileSync(tempFile, memoryStr, 'utf8');
+    fsSync.renameSync(tempFile, MEMORY_FILE);
+    logger.info('Synchronous save completed');
+  } catch (error) {
+    logger.error('Synchronous save failed', error);
+  }
+}
+
+function queueSave() {
+  if (saveScheduled) return;
+  saveScheduled = true;
+
+  setImmediate(() => {
+    saveQueue = saveQueue.then(async () => {
+      saveScheduled = false;
+      await saveMemory();
+    }).catch(err => {
+      saveScheduled = false;
+      logger.error('Queued save failed', err);
+    });
+  });
+}
+
+// Create backups
+async function createBackup() {
+  try {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupFile = path.join(BACKUP_DIR, `memory-${timestamp}.json`);
+    
+    await fs.copyFile(MEMORY_FILE, backupFile);
+    logger.info('Backup created', { file: backupFile });
+
+    // Clean old backups
+    const files = await fs.readdir(BACKUP_DIR);
+    const backupFiles = files
+      .filter(f => f.startsWith('memory-') && f.endsWith('.json'))
+      .map(f => ({ name: f, path: path.join(BACKUP_DIR, f) }));
+
+    if (backupFiles.length > CONFIG.MAX_BACKUPS) {
+      const stats = await Promise.all(
+        backupFiles.map(async f => ({
+          ...f,
+          mtime: (await fs.stat(f.path)).mtime
+        }))
+      );
+
+      stats.sort((a, b) => b.mtime - a.mtime);
+      
+      for (const file of stats.slice(CONFIG.MAX_BACKUPS)) {
+        await fs.unlink(file.path);
+        logger.info('Old backup removed', { file: file.name });
+      }
+    }
+  } catch (error) {
+    logger.error('Backup creation failed', error);
+  }
+}
+
+// ============================================================================
+// GRACEFUL SHUTDOWN
+// ============================================================================
+
+async function gracefulShutdown(signal) {
+  logger.info('Shutdown signal received', { signal });
+
+  try {
+    await saveQueue;
+    await saveMemory();
+    await createBackup();
+    logger.info('Graceful shutdown completed');
+  } catch (err) {
+    logger.error('Error during shutdown', err);
+  }
+
+  try {
+    saveMemorySync();
+  } catch (err) {
+    logger.error('Final sync save failed', err);
+  }
+
+  if (pgPool) {
+    await pgPool.end();
+  }
+
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGUSR2', () => gracefulShutdown('SIGUSR2'));
+
+// ============================================================================
+// MIDDLEWARE
+// ============================================================================
+
+// Request ID middleware
+app.use((req, res, next) => {
+  const requestId = crypto.randomBytes(16).toString('hex');
+  req.requestId = requestId;
+  res.setHeader('X-Request-ID', requestId);
+  next();
+});
+
+// Logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    logger.setRequestId(req.requestId).info('Request completed', {
+      method: req.method,
+      path: req.path,
+      status: res.statusCode,
+      duration
+    });
+  });
+  
+  next();
+});
+
+// Body parser with size limit
+app.use(bodyParser.json({ limit: '10mb' }));
+
+// Rate limiting middleware
+app.use((req, res, next) => {
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  const result = rateLimiter.check(ip);
+
+  res.setHeader('X-RateLimit-Limit', CONFIG.RATE_LIMIT_MAX_REQUESTS);
+  res.setHeader('X-RateLimit-Remaining', result.remaining);
+
+  if (!result.allowed) {
+    res.setHeader('X-RateLimit-Reset', new Date(result.resetTime).toISOString());
+    logger.setRequestId(req.requestId).warn('Rate limit exceeded', { ip, path: req.path });
+    return res.status(429).json({
+      error: 'Too many requests',
+      retryAfter: Math.ceil((result.resetTime - Date.now()) / 1000)
+    });
+  }
+
+  next();
+});
+
+// CORS middleware
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  
+  if (CONFIG.ALLOWED_ORIGINS.includes('*')) {
+    res.header('Access-Control-Allow-Origin', '*');
+  } else if (origin && CONFIG.ALLOWED_ORIGINS.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+  }
+  
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, X-Request-ID');
+  res.header('Access-Control-Expose-Headers', 'X-Request-ID, X-RateLimit-Limit, X-RateLimit-Remaining');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  
+  next();
+});
+
+// Security headers
+app.use((req, res, next) => {
+  res.header('X-Content-Type-Options', 'nosniff');
+  res.header('X-Frame-Options', 'DENY');
+  res.header('X-XSS-Protection', '1; mode=block');
+  res.header('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com;");
+  next();
+});
+
+app.use(express.static('public'));
+
+// ============================================================================
+// API ROUTES
+// ============================================================================
+
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+// Metrics endpoint
+app.get('/api/metrics', (req, res) => {
+  res.json({
+    metrics: metrics.getMetrics(),
+    sessions: {
+      active: sessionManager.getActiveCount(),
+      max: CONFIG.MAX_SESSIONS
+    },
+    memory: {
+      contextPairs: globalMemory.contextPairs.length,
+      semanticClusters: Object.keys(globalMemory.semanticClusters).length,
+      stats: globalMemory.stats
+    }
+  });
+});
+
+// Stats endpoint
+app.get('/api/stats', (req, res) => {
+  sessionManager.cleanup();
+
+  res.json({
+    stats: globalMemory.stats,
+    activeUsers: sessionManager.getActiveCount(),
+    memorySize: {
+      contextPairs: globalMemory.contextPairs.length,
+      semanticClusters: Object.keys(globalMemory.semanticClusters).length,
+      totalLearned: globalMemory.contextPairs.length +
+        Object.values(globalMemory.semanticClusters).reduce((sum, cluster) => sum + cluster.length, 0)
+    }
+  });
+});
+
+// Text check endpoint
+app.post('/api/check-text', (req, res) => {
+  try {
+    const { text } = req.body || {};
+    
+    if (typeof text !== 'string') {
+      return res.status(400).json({ error: 'text is required' });
+    }
+
+    const profanity = GarbageClassifier.containsProfanity(text);
+    const flagged = GarbageClassifier.isGarbage(text);
+
+    res.json({
+      text,
+      flagged,
+      profanityMatches: profanity.matches
+    });
+  } catch (err) {
+    logger.setRequestId(req.requestId).error('check-text error', err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+// Chat endpoint
 app.post('/api/chat', async (req, res) => {
   const startTime = Date.now();
+  const requestLogger = logger.setRequestId(req.requestId);
+  
   try {
     const { message, sessionId = 'default' } = req.body;
 
-    if (!message) {
-      return res.status(400).json({ error: 'Message is required' });
+    // Validate input
+    const messageValidation = InputValidator.validateMessage(message);
+    if (!messageValidation.valid) {
+      metrics.recordRequest(Date.now() - startTime, true);
+      return res.status(400).json({ error: messageValidation.error });
     }
+
+    const sessionValidation = InputValidator.validateSessionId(sessionId);
+    if (!sessionValidation.valid) {
+      metrics.recordRequest(Date.now() - startTime, true);
+      return res.status(400).json({ error: sessionValidation.error });
+    }
+
+    const cleanedMessage = TextCleaner.clean(messageValidation.message);
     
-    // Clean the user message
-    const cleanedMessage = TextCleaner.clean(message);
-    
+    // Check for garbage
     if (!cleanedMessage || GarbageClassifier.isGarbage(cleanedMessage)) {
+      globalMemory.stats.garbageFiltered++;
+      metrics.recordRequest(Date.now() - startTime);
+      
       return res.json({
         response: "Let's keep our conversation meaningful and respectful! 😊",
         learned: false,
-        stats: globalMemory.stats
+        stats: globalMemory.stats,
+        activeUsers: sessionManager.getActiveCount()
       });
     }
+    
+    // Update session activity
+    sessionManager.updateActivity(sessionId);
     
     // Try to find a learned response
     let response = IntelligentLearner.findBestResponse(cleanedMessage);
     let isLearned = !!response;
     
-    // Cleverbot-style fallback responses - natural and casual
+    // Fallback responses
     if (!response) {
       const lower = cleanedMessage.toLowerCase();
 
-      // Detect greetings - respond naturally
       if (lower.match(/^(hi|hey|hello|sup|yo|greetings|howdy|wassup|what's up)\b/)) {
-        const greetingFallbacks = [
-          "hey",
-          "hi",
-          "hello",
-          "hey there",
-          "hi!",
-          "sup",
-          "yo",
-          "hey! how are you?",
-          "hello! how's it going?",
+        const greetings = [
+          "hey", "hi", "hello", "hey there", "hi!", "sup", "yo",
+          "hey! how are you?", "hello! how's it going?"
         ];
-        response = greetingFallbacks[Math.floor(Math.random() * greetingFallbacks.length)];
-      }
-      // Detect "how are you" type questions
-      else if (lower.match(/how (are|r) (you|u)|how's it going|hows it going|what's up|whats up/)) {
-        const statusFallbacks = [
-          "good, you?",
-          "pretty good!",
-          "not bad, how about you?",
-          "doing alright",
-          "i'm good thanks",
-          "fine, and you?",
-          "great! how are you?",
+        response = greetings[Math.floor(Math.random() * greetings.length)];
+      } else if (lower.match(/how (are|r) (you|u)|how's it going|hows it going|what's up|whats up/)) {
+        const statuses = [
+          "good, you?", "pretty good!", "not bad, how about you?",
+          "doing alright", "i'm good thanks", "fine, and you?", "great! how are you?"
         ];
-        response = statusFallbacks[Math.floor(Math.random() * statusFallbacks.length)];
-      }
-      // Detect questions - turn them back
-      else if (lower.match(/^(what|where|when|who|why|how|which|whose|\?)/)) {
-        const questionFallbacks = [
-          "what do you think?",
-          "i'm not sure, what would you say?",
-          "hmm, good question",
-          "that's interesting, tell me your thoughts",
-          "not sure tbh",
-          "idk, what about you?",
-          "what's your take on it?",
+        response = statuses[Math.floor(Math.random() * statuses.length)];
+      } else if (lower.match(/^(what|where|when|who|why|how|which|whose|\?)/)) {
+        const questions = [
+          "what do you think?", "i'm not sure, what would you say?",
+          "hmm, good question", "that's interesting, tell me your thoughts",
+          "not sure tbh", "idk, what about you?", "what's your take on it?"
         ];
-        response = questionFallbacks[Math.floor(Math.random() * questionFallbacks.length)];
-      }
-      // General conversational fallbacks - short and natural like humans
-      else {
-        const casualFallbacks = [
-          "oh really?",
-          "interesting",
-          "cool",
-          "nice",
-          "that's cool",
-          "oh nice",
-          "yeah?",
-          "for real?",
-          "i see",
-          "tell me more",
-          "go on",
-          "interesting!",
-          "oh wow",
-          "haha nice",
-          "that's interesting",
-          "cool, tell me more",
-          "nice! what else?",
-          "oh that's cool",
-          "i feel that",
-          "makes sense",
+        response = questions[Math.floor(Math.random() * questions.length)];
+      } else {
+        const casual = [
+          "oh really?", "interesting", "cool", "nice", "that's cool",
+          "oh nice", "yeah?", "for real?", "i see", "tell me more",
+          "go on", "interesting!", "oh wow", "haha nice", "that's interesting",
+          "cool, tell me more", "nice! what else?", "oh that's cool",
+          "i feel that", "makes sense"
         ];
-        response = casualFallbacks[Math.floor(Math.random() * casualFallbacks.length)];
+        response = casual[Math.floor(Math.random() * casual.length)];
       }
     }
     
-    // Store conversation in buffer for potential learning
-    if (!conversationBuffer.has(sessionId)) {
-      conversationBuffer.set(sessionId, []);
-    }
-    const history = conversationBuffer.get(sessionId);
-    history.push({ user: cleanedMessage, ai: response, timestamp: Date.now() });
+    // Store conversation and learn
+    const history = sessionManager.getConversationHistory(sessionId);
+    sessionManager.addToHistory(sessionId, cleanedMessage, response);
     
-    // Track active session
-    activeSessions.set(sessionId, Date.now());
-    
-    // Keep only last 10 exchanges per session
-    if (history.length > 10) {
-      history.shift();
-    }
-    
-    // Cleverbot-style learning: previous user message -> current user message
-    // This learns conversational flow patterns from actual human responses
+    // Learn from conversation patterns
     if (history.length >= 2) {
       const prevPair = history[history.length - 2];
-      const currentUserMsg = cleanedMessage;
+      
+      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(cleanedMessage)) {
+        const quality = GarbageClassifier.calculateQuality(prevPair.user, cleanedMessage);
 
-      // Learn from user -> user patterns (ignore what the AI said in between)
-      if (!GarbageClassifier.isGarbage(prevPair.user) && !GarbageClassifier.isGarbage(currentUserMsg)) {
-        const quality = GarbageClassifier.calculateQuality(prevPair.user, currentUserMsg);
-
-        // Lower threshold to accept natural human conversation (including short responses)
-        if (quality >= 40) {
-          // Learn: what humans say in response to previous human messages
-          IntelligentLearner.learnPattern(prevPair.user, currentUserMsg, quality);
+        if (quality >= CONFIG.MIN_QUALITY_SCORE) {
+          IntelligentLearner.learnPattern(prevPair.user, cleanedMessage, quality);
           globalMemory.stats.liveConversationsLearned++;
-          logger.info('Live conversation learned', {
+          metrics.recordLearning();
+          
+          requestLogger.info('Pattern learned', {
             input: prevPair.user,
-            response: currentUserMsg,
+            response: cleanedMessage,
             quality,
-            totalLiveLearned: globalMemory.stats.liveConversationsLearned
+            totalLearned: globalMemory.stats.liveConversationsLearned
           });
 
-          // Immediately queue a save (batched by queueSave) to persist live learnings quickly.
-          // queueSave is idempotent / debounced so this won't cause excessive writes.
           if (FORCE_SYNC_ON_LEARN) {
             try {
               saveMemorySync();
-              logger.info('Sync save performed on live learn');
             } catch (err) {
-              logger.error('Sync save failed on live learn', err);
+              requestLogger.error('Sync save failed', err);
             }
           } else {
             queueSave();
@@ -942,90 +1312,77 @@ app.post('/api/chat', async (req, res) => {
 
     globalMemory.stats.totalMessages++;
 
-    // Queue periodic save every 10 messages (more frequent to reduce data loss)
+    // Periodic save
     if (globalMemory.stats.totalMessages % 10 === 0) {
       queueSave();
     }
     
     const duration = Date.now() - startTime;
-    logger.info('Chat request processed', { sessionId, duration, learned: isLearned });
+    metrics.recordRequest(duration);
+    
+    requestLogger.info('Chat completed', {
+      sessionId,
+      duration,
+      learned: isLearned,
+      messageLength: cleanedMessage.length
+    });
 
     res.json({
       response,
       learned: isLearned,
       stats: globalMemory.stats,
-      activeUsers: activeSessions.size
+      activeUsers: sessionManager.getActiveCount(),
+      requestId: req.requestId
     });
   } catch (error) {
-    logger.error('Chat error', error, { sessionId: req.body?.sessionId });
+    const duration = Date.now() - startTime;
+    metrics.recordRequest(duration, true);
+    requestLogger.error('Chat error', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Training endpoint removed — use offline tooling or admin scripts for bulk training.
-// Keep a minimal 410 response so clients know the endpoint is intentionally gone.
+// Deprecated training endpoint
 app.post('/api/train', (req, res) => {
-  logger.warn('Deprecated endpoint /api/train called');
-  res.status(410).json({ error: 'Training endpoint has been removed.' });
+  logger.setRequestId(req.requestId).warn('Deprecated endpoint called');
+  res.status(410).json({ error: 'Training endpoint has been removed' });
 });
 
-app.post('/api/check-text', (req, res) => {
-  try {
-    const { text } = req.body || {};
-    if (typeof text !== 'string') return res.status(400).json({ error: 'text is required in the request body' });
-
-    const profanity = containsProfanity(text);
-    const flagged = GarbageClassifier.isGarbage(text);
-
-    res.json({ text, flagged, profanityMatches: profanity.matches });
-  } catch (err) {
-    logger.error('check-text error', err);
-    res.status(500).json({ error: 'internal error' });
-  }
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ error: 'Not found' });
 });
 
-app.get('/api/stats', (req, res) => {
-  // Clean up old sessions (>5 minutes inactive)
-  const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
-  let cleanedSessions = 0;
-
-  for (const [sessionId, lastActivity] of activeSessions.entries()) {
-    if (lastActivity < fiveMinutesAgo) {
-      activeSessions.delete(sessionId);
-      conversationBuffer.delete(sessionId);
-      cleanedSessions++;
-    }
-  }
-
-  if (cleanedSessions > 0) {
-    logger.info('Cleaned up inactive sessions', { count: cleanedSessions });
-  }
-
-  res.json({
-    stats: globalMemory.stats,
-    activeUsers: activeSessions.size,
-    memorySize: {
-      contextPairs: globalMemory.contextPairs.length,
-      semanticClusters: Object.keys(globalMemory.semanticClusters).length,
-      totalLearned: globalMemory.contextPairs.length +
-        Object.values(globalMemory.semanticClusters).reduce((sum, cluster) => sum + cluster.length, 0)
-    }
-  });
+// Error handler
+app.use((err, req, res, next) => {
+  logger.setRequestId(req.requestId).error('Unhandled error', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
-// Initialize and start server
+// ============================================================================
+// SERVER INITIALIZATION
+// ============================================================================
+
 loadMemory().then(() => {
   app.listen(PORT, '0.0.0.0', () => {
     logger.info('TuringAI server started', {
       port: PORT,
-      stats: globalMemory.stats
+      stats: globalMemory.stats,
+      config: {
+        allowedOrigins: CONFIG.ALLOWED_ORIGINS,
+        rateLimit: `${CONFIG.RATE_LIMIT_MAX_REQUESTS}/${CONFIG.RATE_LIMIT_WINDOW_MS}ms`,
+        maxSessions: CONFIG.MAX_SESSIONS
+      }
     });
   });
 
-  const SAVE_INTERVAL_MS = parseInt(process.env.SAVE_INTERVAL_MS, 10) || 60 * 1000;
-  logger.info('Memory persistence configured', { FORCE_SYNC_ON_LEARN, SAVE_INTERVAL_MS });
-  // Auto-save as a safety net (configurable via SAVE_INTERVAL_MS env var)
+  // Auto-save interval
   setInterval(() => {
     queueSave();
-  }, SAVE_INTERVAL_MS);
+  }, CONFIG.SAVE_INTERVAL_MS);
+
+  // Backup interval
+  setInterval(() => {
+    createBackup();
+  }, CONFIG.BACKUP_INTERVAL_MS);
 });
